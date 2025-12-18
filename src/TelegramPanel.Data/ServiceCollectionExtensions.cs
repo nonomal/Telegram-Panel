@@ -17,7 +17,9 @@ public static class ServiceCollectionExtensions
 
         // 注册所有Repository
         services.AddScoped<IAccountRepository, AccountRepository>();
+        services.AddScoped<IAccountCategoryRepository, AccountCategoryRepository>();
         services.AddScoped<IChannelRepository, ChannelRepository>();
+        services.AddScoped<IChannelGroupRepository, ChannelGroupRepository>();
         services.AddScoped<IGroupRepository, GroupRepository>();
         services.AddScoped<IBatchTaskRepository, BatchTaskRepository>();
         services.AddScoped(typeof(IRepository<>), typeof(Repository<>));

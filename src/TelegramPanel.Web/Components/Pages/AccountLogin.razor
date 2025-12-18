@@ -1,6 +1,9 @@
 @page "/accounts/login"
 @inject IAccountService AccountService
+@inject AccountManagementService AccountManagement
 @inject ISnackbar Snackbar
+@inject NavigationManager Navigation
+@using TelegramPanel.Data.Entities
 
 <PageTitle>手机号登录 - Telegram Panel</PageTitle>
 
@@ -16,6 +19,9 @@
                         <MudTextField @bind-Value="apiHash" Label="API Hash" Variant="Variant.Outlined" Required="true" Class="mt-3" />
                         <MudTextField @bind-Value="phoneNumber" Label="手机号" Variant="Variant.Outlined" Required="true"
                                       Placeholder="+86xxxxxxxxxx" Class="mt-3" />
+                        <MudText Typo="Typo.caption" Class="mt-2" Color="Color.Info">
+                            * 手机号需包含国家代码，例如：+8613800138000
+                        </MudText>
                     </MudStep>
 
                     <MudStep Title="验证码" IsResultStep="false">
@@ -24,6 +30,9 @@
                         </MudText>
                         <MudTextField @bind-Value="verificationCode" Label="验证码" Variant="Variant.Outlined" Required="true"
                                       Placeholder="12345" />
+                        <MudText Typo="Typo.caption" Class="mt-2" Color="Color.Info">
+                            请在Telegram客户端查收验证码
+                        </MudText>
                     </MudStep>
 
                     <MudStep Title="密码验证" Optional="true">
@@ -36,10 +45,14 @@
 
                     <MudStep Title="完成" IsResultStep="true">
                         <MudAlert Severity="Severity.Success" Class="mb-3">
-                            <MudText Typo="Typo.body1">登录成功！</MudText>
+                            <MudText Typo="Typo.body1">登录成功并保存到数据库！</MudText>
                         </MudAlert>
-                        <MudText Typo="Typo.body2">用户名：@username</MudText>
-                        <MudText Typo="Typo.body2">用户ID：@userId</MudText>
+                        <MudText Typo="Typo.body2"><strong>手机号：</strong>@phoneNumber</MudText>
+                        <MudText Typo="Typo.body2"><strong>用户名：</strong>@(username ?? "无")</MudText>
+                        <MudText Typo="Typo.body2"><strong>用户ID：</strong>@userId</MudText>
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" Href="/accounts" Class="mt-4">
+                            查看账号列表
+                        </MudButton>
                     </MudStep>
                 </MudStepper>
             </MudCardContent>
@@ -48,7 +61,7 @@
                     重置
                 </MudButton>
                 <MudSpacer />
-                @if (stepper.GetActiveIndex() > 0)
+                @if (stepper.GetActiveIndex() > 0 && !stepper.IsAllStepsCompleted())
                 {
                     <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="@(() => stepper.Previous())">
                         上一步
@@ -84,62 +97,96 @@
     private string verificationCode = "";
     private string password = "";
 
-    private string username = "";
+    private string? username = "";
     private long userId = 0;
+    private int accountId = 0;
 
     private async Task NextStep()
     {
         var currentStep = stepper.GetActiveIndex();
-
         logging = true;
 
         try
         {
             if (currentStep == 0)
             {
-                // 验证 API 配置并发送验证码
-                if (!int.TryParse(apiId, out _))
+                // 步骤1：验证 API 配置并发送验证码
+                if (!int.TryParse(apiId, out int parsedApiId))
                 {
                     Snackbar.Add("API ID 格式错误", Severity.Error);
                     return;
                 }
 
-                // TODO: 调用 API 发送验证码
-                Snackbar.Add($"验证码已发送到 {phoneNumber}", Severity.Info);
-                stepper.Next();
+                if (string.IsNullOrWhiteSpace(apiHash) || string.IsNullOrWhiteSpace(phoneNumber))
+                {
+                    Snackbar.Add("请填写完整信息", Severity.Error);
+                    return;
+                }
+
+                // 生成临时账号ID（用于跟踪登录过程）
+                accountId = DateTime.UtcNow.GetHashCode();
+
+                var result = await AccountService.StartLoginAsync(accountId, phoneNumber);
+
+                if (result.NextStep == "code")
+                {
+                    Snackbar.Add($"验证码已发送到 {phoneNumber}", Severity.Info);
+                    stepper.Next();
+                }
+                else if (result.NextStep == "signup")
+                {
+                    Snackbar.Add("此号码未注册Telegram，请先注册", Severity.Error);
+                }
+                else
+                {
+                    Snackbar.Add(result.Message ?? "发送验证码失败", Severity.Error);
+                }
             }
             else if (currentStep == 1)
             {
-                // 验证验证码
-                if (string.IsNullOrEmpty(verificationCode))
+                // 步骤2：验证验证码
+                if (string.IsNullOrWhiteSpace(verificationCode))
                 {
                     Snackbar.Add("请输入验证码", Severity.Error);
                     return;
                 }
 
-                // TODO: 验证验证码，检查是否需要密码
-                bool needsPassword = false; // 模拟
+                var result = await AccountService.SubmitCodeAsync(accountId, verificationCode);
 
-                if (needsPassword)
+                if (result.Success)
                 {
+                    // 登录成功，保存到数据库
+                    await SaveAccount(result.Account!);
+                }
+                else if (result.NextStep == "password")
+                {
+                    Snackbar.Add("需要两步验证密码", Severity.Info);
                     stepper.Next();
                 }
                 else
                 {
-                    // 直接完成登录
-                    await CompleteLogin();
+                    Snackbar.Add(result.Message ?? "验证码错误", Severity.Error);
                 }
             }
             else if (currentStep == 2)
             {
-                // 验证密码并完成登录
-                if (string.IsNullOrEmpty(password))
+                // 步骤3：验证密码
+                if (string.IsNullOrWhiteSpace(password))
                 {
                     Snackbar.Add("请输入密码", Severity.Error);
                     return;
                 }
 
-                await CompleteLogin();
+                var result = await AccountService.SubmitPasswordAsync(accountId, password);
+
+                if (result.Success)
+                {
+                    await SaveAccount(result.Account!);
+                }
+                else
+                {
+                    Snackbar.Add(result.Message ?? "密码错误", Severity.Error);
+                }
             }
         }
         catch (Exception ex)
@@ -152,13 +199,53 @@
         }
     }
 
-    private async Task CompleteLogin()
+    private async Task SaveAccount(TelegramPanel.Core.Models.AccountInfo accountInfo)
     {
-        // TODO: 完成登录并保存 session
-        username = "TestUser";
-        userId = 123456789;
+        try
+        {
+            // 检查账号是否已存在
+            var existingAccount = await AccountManagement.GetAccountByPhoneAsync(accountInfo.Phone!);
 
-        Snackbar.Add("登录成功！", Severity.Success);
-        stepper.Next();
+            if (existingAccount != null)
+            {
+                // 更新现有账号
+                existingAccount.Username = accountInfo.Username;
+                existingAccount.IsActive = true;
+                existingAccount.LastSyncAt = DateTime.UtcNow;
+                await AccountManagement.UpdateAccountAsync(existingAccount);
+
+                Snackbar.Add("账号信息已更新", Severity.Success);
+            }
+            else
+            {
+                // 创建新账号
+                var account = new Account
+                {
+                    Phone = accountInfo.Phone!,
+                    UserId = accountInfo.TelegramUserId,
+                    Username = accountInfo.Username,
+                    SessionPath = $"sessions/{accountInfo.Phone}.session",
+                    ApiId = int.Parse(apiId),
+                    ApiHash = apiHash,
+                    IsActive = true,
+                    CreatedAt = DateTime.UtcNow,
+                    LastSyncAt = DateTime.UtcNow
+                };
+
+                await AccountManagement.CreateAccountAsync(account);
+                Snackbar.Add("账号已保存到数据库", Severity.Success);
+            }
+
+            // 设置显示信息
+            username = accountInfo.Username;
+            userId = accountInfo.TelegramUserId;
+
+            // 跳转到完成步骤
+            stepper.Next();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存账号失败：{ex.Message}", Severity.Error);
+        }
     }
 }

@@ -1,6 +1,8 @@
 @page "/accounts"
-@inject IAccountService AccountService
+@inject AccountManagementService AccountManagement
 @inject ISnackbar Snackbar
+@inject IDialogService DialogService
+@using TelegramPanel.Data.Entities
 
 <PageTitle>账号列表 - Telegram Panel</PageTitle>
 
@@ -8,18 +10,22 @@
 
 <MudCard>
     <MudCardContent>
-        <MudTable Items="@accounts" Hover="true" Breakpoint="Breakpoint.Sm" Loading="@loading">
+        <MudTable Items="@filteredAccounts" Hover="true" Breakpoint="Breakpoint.Sm" Loading="@loading">
             <ToolBarContent>
-                <MudText Typo="Typo.h6">已导入账号</MudText>
+                <MudText Typo="Typo.h6">已导入账号 (@accounts.Count)</MudText>
                 <MudSpacer />
                 <MudTextField @bind-Value="searchString" Placeholder="搜索账号..." Adornment="Adornment.Start"
-                              AdornmentIcon="@Icons.Material.Filled.Search" IconSize="Size.Medium" Class="mt-0" />
+                              AdornmentIcon="@Icons.Material.Filled.Search" IconSize="Size.Medium" Class="mt-0"
+                              Immediate="true" />
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Material.Filled.Refresh"
+                           OnClick="LoadAccounts" Class="ml-2">刷新</MudButton>
             </ToolBarContent>
             <HeaderContent>
                 <MudTh>手机号</MudTh>
                 <MudTh>用户名</MudTh>
                 <MudTh>用户ID</MudTh>
                 <MudTh>分类</MudTh>
+                <MudTh>频道/群组</MudTh>
                 <MudTh>状态</MudTh>
                 <MudTh>最后同步</MudTh>
                 <MudTh>操作</MudTh>
@@ -28,22 +34,40 @@
                 <MudTd DataLabel="手机号">@context.Phone</MudTd>
                 <MudTd DataLabel="用户名">@(context.Username ?? "-")</MudTd>
                 <MudTd DataLabel="用户ID">@context.UserId</MudTd>
-                <MudTd DataLabel="分类">@(context.Category ?? "未分类")</MudTd>
+                <MudTd DataLabel="分类">
+                    @if (context.Category != null)
+                    {
+                        <MudChip Size="Size.Small" Style="@($"background-color: {context.Category.Color ?? "#9E9E9E"}")">
+                            @context.Category.Name
+                        </MudChip>
+                    }
+                    else
+                    {
+                        <MudText Typo="Typo.body2" Color="Color.Default">未分类</MudText>
+                    }
+                </MudTd>
+                <MudTd DataLabel="频道/群组">
+                    <MudText Typo="Typo.body2">@context.Channels.Count / @context.Groups.Count</MudText>
+                </MudTd>
                 <MudTd DataLabel="状态">
                     <MudChip Size="Size.Small" Color="@(context.IsActive ? Color.Success : Color.Default)">
-                        @(context.IsActive ? "在线" : "离线")
+                        @(context.IsActive ? "活跃" : "停用")
                     </MudChip>
                 </MudTd>
                 <MudTd DataLabel="最后同步">@context.LastSyncAt.ToString("yyyy-MM-dd HH:mm")</MudTd>
                 <MudTd DataLabel="操作">
                     <MudIconButton Icon="@Icons.Material.Filled.Info" Size="Size.Small" Color="Color.Info"
-                                   OnClick="@(() => ShowDetails(context))" />
+                                   OnClick="@(() => ShowDetails(context))" Title="查看详情" />
+                    <MudIconButton Icon="@(context.IsActive ? Icons.Material.Filled.Stop : Icons.Material.Filled.PlayArrow)"
+                                   Size="Size.Small" Color="@(context.IsActive ? Color.Warning : Color.Success)"
+                                   OnClick="@(() => ToggleActive(context))"
+                                   Title="@(context.IsActive ? "停用" : "启用")" />
                     <MudIconButton Icon="@Icons.Material.Filled.Delete" Size="Size.Small" Color="Color.Error"
-                                   OnClick="@(() => DeleteAccount(context.Id))" />
+                                   OnClick="@(() => DeleteAccount(context))" Title="删除账号" />
                 </MudTd>
             </RowTemplate>
             <NoRecordsContent>
-                <MudText>暂无账号数据，请先导入账号</MudText>
+                <MudText>暂无账号数据，请先<MudLink Href="/accounts/import">导入账号</MudLink></MudText>
             </NoRecordsContent>
             <LoadingContent>
                 <MudProgressCircular Indeterminate="true" />
@@ -53,9 +77,17 @@
 </MudCard>
 
 @code {
-    private List<AccountInfo> accounts = new();
+    private List<Account> accounts = new();
     private bool loading = true;
     private string searchString = "";
+
+    private IEnumerable<Account> filteredAccounts =>
+        string.IsNullOrWhiteSpace(searchString)
+            ? accounts
+            : accounts.Where(a =>
+                a.Phone.Contains(searchString, StringComparison.OrdinalIgnoreCase) ||
+                (a.Username?.Contains(searchString, StringComparison.OrdinalIgnoreCase) ?? false) ||
+                a.UserId.ToString().Contains(searchString));
 
     protected override async Task OnInitializedAsync()
     {
@@ -67,9 +99,8 @@
         loading = true;
         try
         {
-            // TODO: 从数据库加载账号列表
-            accounts = new List<AccountInfo>();
-            Snackbar.Add("账号列表加载成功", Severity.Success);
+            var accountList = await AccountManagement.GetAllAccountsAsync();
+            accounts = accountList.ToList();
         }
         catch (Exception ex)
         {
@@ -81,15 +112,57 @@
         }
     }
 
-    private void ShowDetails(AccountInfo account)
+    private async Task ShowDetails(Account account)
     {
-        Snackbar.Add($"查看账号详情：{account.Phone}", Severity.Info);
-        // TODO: 显示账号详情对话框
+        var (channels, groups) = await AccountManagement.GetAccountStatisticsAsync(account.Id);
+        var message = $@"
+账号详情：
+手机号：{account.Phone}
+用户名：{account.Username ?? "无"}
+用户ID：{account.UserId}
+分类：{account.Category?.Name ?? "未分类"}
+创建的频道：{channels} 个
+创建的群组：{groups} 个
+创建时间：{account.CreatedAt:yyyy-MM-dd HH:mm}
+最后同步：{account.LastSyncAt:yyyy-MM-dd HH:mm}
+Session路径：{account.SessionPath}
+";
+        await DialogService.ShowMessageBox("账号详情", message, "关闭");
     }
 
-    private async Task DeleteAccount(int accountId)
+    private async Task ToggleActive(Account account)
     {
-        // TODO: 确认对话框 + 删除账号
-        Snackbar.Add("删除功能开发中", Severity.Warning);
+        try
+        {
+            await AccountManagement.SetAccountActiveStatusAsync(account.Id, !account.IsActive);
+            account.IsActive = !account.IsActive;
+            Snackbar.Add($"账号已{(account.IsActive ? "启用" : "停用")}", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"操作失败：{ex.Message}", Severity.Error);
+        }
+    }
+
+    private async Task DeleteAccount(Account account)
+    {
+        bool? result = await DialogService.ShowMessageBox(
+            "确认删除",
+            $"确定要删除账号 {account.Phone} 吗？此操作不可撤销！",
+            yesText: "删除", cancelText: "取消");
+
+        if (result == true)
+        {
+            try
+            {
+                await AccountManagement.DeleteAccountAsync(account.Id);
+                accounts.Remove(account);
+                Snackbar.Add("账号已删除", Severity.Success);
+            }
+            catch (Exception ex)
+            {
+                Snackbar.Add($"删除失败：{ex.Message}", Severity.Error);
+            }
+        }
     }
 }

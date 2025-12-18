@@ -26,7 +26,9 @@ public static class ServiceCollectionExtensions
 
         // 注册数据管理服务
         services.AddScoped<AccountManagementService>();
+        services.AddScoped<AccountCategoryManagementService>();
         services.AddScoped<ChannelManagementService>();
+        services.AddScoped<ChannelGroupManagementService>();
         services.AddScoped<GroupManagementService>();
         services.AddScoped<BatchTaskManagementService>();
 
