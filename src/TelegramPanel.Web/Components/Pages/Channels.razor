@@ -1,0 +1,171 @@
+@page "/channels"
+@inject IChannelService ChannelService
+@inject ISnackbar Snackbar
+@inject NavigationManager Navigation
+
+<PageTitle>频道列表 - Telegram Panel</PageTitle>
+
+<MudText Typo="Typo.h4" Class="mb-4">频道列表</MudText>
+
+<MudCard>
+    <MudCardContent>
+        <MudTable Items="@channels" Hover="true" Breakpoint="Breakpoint.Sm" Loading="@loading" Filter="new Func<ChannelInfo,bool>(FilterFunc)">
+            <ToolBarContent>
+                <MudText Typo="Typo.h6">我的频道</MudText>
+                <MudSpacer />
+                <MudSelect @bind-Value="filterAccount" Label="筛选账号" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 200px;">
+                    <MudSelectItem Value="0">全部账号</MudSelectItem>
+                    <MudSelectItem Value="1">账号1 (+86xxx)</MudSelectItem>
+                    <MudSelectItem Value="2">账号2 (+86yyy)</MudSelectItem>
+                </MudSelect>
+                <MudSelect @bind-Value="filterType" Label="频道类型" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 120px;">
+                    <MudSelectItem Value="all">全部</MudSelectItem>
+                    <MudSelectItem Value="public">公开</MudSelectItem>
+                    <MudSelectItem Value="private">私密</MudSelectItem>
+                </MudSelect>
+                <MudTextField @bind-Value="searchString" Placeholder="搜索频道..." Adornment="Adornment.Start"
+                              AdornmentIcon="@Icons.Material.Filled.Search" IconSize="Size.Medium" Class="mt-0" />
+            </ToolBarContent>
+            <HeaderContent>
+                <MudTh>频道名称</MudTh>
+                <MudTh>用户名</MudTh>
+                <MudTh>类型</MudTh>
+                <MudTh>成员数</MudTh>
+                <MudTh>创建账号</MudTh>
+                <MudTh>最后同步</MudTh>
+                <MudTh>操作</MudTh>
+            </HeaderContent>
+            <RowTemplate>
+                <MudTd DataLabel="频道名称">
+                    <div class="d-flex align-center">
+                        <MudAvatar Color="Color.Primary" Size="Size.Small" Class="mr-2">@context.Title[0]</MudAvatar>
+                        <div>
+                            <MudText Typo="Typo.body2"><strong>@context.Title</strong></MudText>
+                            @if (!string.IsNullOrEmpty(context.About))
+                            {
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">@context.About</MudText>
+                            }
+                        </div>
+                    </div>
+                </MudTd>
+                <MudTd DataLabel="用户名">
+                    @if (!string.IsNullOrEmpty(context.Username))
+                    {
+                        <MudChip Size="Size.Small" Icon="@Icons.Material.Filled.AlternateEmail">@context.Username</MudChip>
+                    }
+                    else
+                    {
+                        <span>-</span>
+                    }
+                </MudTd>
+                <MudTd DataLabel="类型">
+                    <MudChip Size="Size.Small" Color="@(string.IsNullOrEmpty(context.Username) ? Color.Warning : Color.Success)">
+                        @(string.IsNullOrEmpty(context.Username) ? "私密" : "公开")
+                    </MudChip>
+                </MudTd>
+                <MudTd DataLabel="成员数">@context.MemberCount</MudTd>
+                <MudTd DataLabel="创建账号">账号 @context.CreatorAccountId</MudTd>
+                <MudTd DataLabel="最后同步">@context.SyncedAt.ToString("yyyy-MM-dd HH:mm")</MudTd>
+                <MudTd DataLabel="操作">
+                    <MudMenu Icon="@Icons.Material.Filled.MoreVert" Size="Size.Small">
+                        <MudMenuItem Icon="@Icons.Material.Filled.Info" OnClick="@(() => ShowDetails(context))">查看详情</MudMenuItem>
+                        <MudMenuItem Icon="@Icons.Material.Filled.Edit" OnClick="@(() => EditChannel(context))">编辑频道</MudMenuItem>
+                        <MudMenuItem Icon="@Icons.Material.Filled.PersonAdd" OnClick="@(() => InviteUsers(context))">邀请用户</MudMenuItem>
+                        <MudMenuItem Icon="@Icons.Material.Filled.Link" OnClick="@(() => CopyLink(context))">复制链接</MudMenuItem>
+                        <MudDivider />
+                        <MudMenuItem Icon="@Icons.Material.Filled.Delete" IconColor="Color.Error" OnClick="@(() => DeleteChannel(context.Id))">删除频道</MudMenuItem>
+                    </MudMenu>
+                </MudTd>
+            </RowTemplate>
+            <NoRecordsContent>
+                <MudText>暂无频道数据</MudText>
+            </NoRecordsContent>
+            <LoadingContent>
+                <MudProgressCircular Indeterminate="true" />
+            </LoadingContent>
+        </MudTable>
+    </MudCardContent>
+</MudCard>
+
+@code {
+    private List<ChannelInfo> channels = new();
+    private bool loading = true;
+    private string searchString = "";
+    private int filterAccount = 0;
+    private string filterType = "all";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadChannels();
+    }
+
+    private async Task LoadChannels()
+    {
+        loading = true;
+        try
+        {
+            // TODO: 从数据库加载频道列表
+            channels = new List<ChannelInfo>();
+            Snackbar.Add("频道列表加载成功", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"加载失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            loading = false;
+        }
+    }
+
+    private bool FilterFunc(ChannelInfo channel)
+    {
+        if (filterAccount > 0 && channel.CreatorAccountId != filterAccount)
+            return false;
+
+        if (filterType == "public" && string.IsNullOrEmpty(channel.Username))
+            return false;
+
+        if (filterType == "private" && !string.IsNullOrEmpty(channel.Username))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(searchString))
+            return true;
+
+        if (channel.Title.Contains(searchString, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (channel.Username?.Contains(searchString, StringComparison.OrdinalIgnoreCase) == true)
+            return true;
+
+        return false;
+    }
+
+    private void ShowDetails(ChannelInfo channel)
+    {
+        Snackbar.Add($"查看频道详情：{channel.Title}", Severity.Info);
+    }
+
+    private void EditChannel(ChannelInfo channel)
+    {
+        Snackbar.Add($"编辑频道：{channel.Title}", Severity.Info);
+    }
+
+    private void InviteUsers(ChannelInfo channel)
+    {
+        Navigation.NavigateTo($"/batch/invite?channelId={channel.Id}");
+    }
+
+    private void CopyLink(ChannelInfo channel)
+    {
+        var link = string.IsNullOrEmpty(channel.Username)
+            ? $"私密频道（邀请链接待实现）"
+            : $"https://t.me/{channel.Username}";
+        Snackbar.Add($"链接：{link}", Severity.Info);
+    }
+
+    private async Task DeleteChannel(int id)
+    {
+        Snackbar.Add("删除功能开发中", Severity.Warning);
+    }
+}
