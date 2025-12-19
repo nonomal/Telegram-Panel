@@ -15,7 +15,7 @@
             </MudCardHeader>
             <MudCardContent>
                 <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
-                    支持导入账号压缩包：每个账号一个文件夹，文件夹内包含一个 <strong>.json</strong> + 一个 <strong>.session</strong>。
+                    支持批量导入账号压缩包：每个账号一个独立子文件夹，文件夹内包含一个 <strong>.json</strong> + 一个 <strong>.session</strong>。
                 </MudAlert>
 
                 <MudFileUpload T="IReadOnlyList<IBrowserFile>" FilesChanged="OnZipFilesChanged" Accept=".zip" MaximumFileCount="1">
