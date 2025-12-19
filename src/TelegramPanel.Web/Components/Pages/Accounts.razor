@@ -68,7 +68,7 @@
                 <MudTh>频道/群组</MudTh>
                 <MudTh>状态</MudTh>
                 <MudTh>Telegram 状态</MudTh>
-                <MudTh>最后同步</MudTh>
+                <MudTh>最后数据同步</MudTh>
                 <MudTh>操作</MudTh>
             </HeaderContent>
             <RowTemplate>
@@ -99,7 +99,7 @@
                 <MudTd DataLabel="Telegram 状态">
                     @if (telegramStatus.TryGetValue(context.Id, out var s))
                     {
-                        <MudChip T="string" Size="Size.Small" Color="@(s.Ok ? Color.Success : Color.Error)" Title="@(s.Details ?? s.Summary)">
+                        <MudChip T="string" Size="Size.Small" Color="@(s.Ok ? Color.Success : Color.Error)" Title="@(BuildTelegramStatusTitle(s))">
                             @s.Summary
                         </MudChip>
                     }
@@ -108,7 +108,7 @@
                         <MudChip T="string" Size="Size.Small" Color="Color.Default">未检测</MudChip>
                     }
                 </MudTd>
-                <MudTd DataLabel="最后同步">@context.LastSyncAt.ToString("yyyy-MM-dd HH:mm")</MudTd>
+                <MudTd DataLabel="最后数据同步">@context.LastSyncAt.ToString("yyyy-MM-dd HH:mm")</MudTd>
                 <MudTd DataLabel="操作">
                     <MudIconButton Icon="@Icons.Material.Filled.Info" Size="Size.Small" Color="Color.Info"
                                    OnClick="@(() => ShowDetails(context))" Title="查看详情" />
@@ -186,10 +186,24 @@
         {
             var accountList = await AccountManagement.GetAllAccountsAsync();
             accounts = accountList.ToList();
-            // 刷新账号列表后，清理不存在账号的状态缓存
+
+            // 刷新账号列表后，从数据库重建“Telegram 状态”缓存（避免刷新页面后回到未检测）
+            telegramStatus.Clear();
+            foreach (var a in accounts)
+            {
+                if (!a.TelegramStatusCheckedAtUtc.HasValue)
+                    continue;
+                if (string.IsNullOrWhiteSpace(a.TelegramStatusSummary))
+                    continue;
+
+                telegramStatus[a.Id] = new TelegramAccountStatusResult(
+                    Ok: a.TelegramStatusOk ?? false,
+                    Summary: a.TelegramStatusSummary,
+                    Details: a.TelegramStatusDetails,
+                    CheckedAtUtc: a.TelegramStatusCheckedAtUtc.Value);
+            }
+
             var ids = new HashSet<int>(accounts.Select(a => a.Id));
-            foreach (var key in telegramStatus.Keys.Where(k => !ids.Contains(k)).ToList())
-                telegramStatus.Remove(key);
             await LoadCategories();
 
             // 清理已选中但已不存在的账号
@@ -208,8 +222,14 @@
     private async Task ShowDetails(Account account)
     {
         var (channels, groups) = await AccountManagement.GetAccountStatisticsAsync(account.Id);
-        var message = $"账号详情：\n手机号：{account.Phone}\n用户名：{account.Username ?? "无"}\n用户ID：{account.UserId}\n分类：{account.Category?.Name ?? "未分类"}\n创建的频道：{channels} 个\n创建的群组：{groups} 个\n创建时间：{account.CreatedAt:yyyy-MM-dd HH:mm}\n最后同步：{account.LastSyncAt:yyyy-MM-dd HH:mm}\nSession路径：{account.SessionPath}";
+        var message = $"账号详情：\n手机号：{account.Phone}\n用户名：{account.Username ?? "无"}\n用户ID：{account.UserId}\n分类：{account.Category?.Name ?? "未分类"}\n创建的频道：{channels} 个\n创建的群组：{groups} 个\n创建时间：{account.CreatedAt:yyyy-MM-dd HH:mm}\n最后数据同步：{account.LastSyncAt:yyyy-MM-dd HH:mm}\nSession路径：{account.SessionPath}";
         await DialogService.ShowMessageBox("账号详情", message, "关闭");
+    }
+
+    private static string BuildTelegramStatusTitle(TelegramAccountStatusResult s)
+    {
+        var details = string.IsNullOrWhiteSpace(s.Details) ? s.Summary : s.Details;
+        return $"{details}（检测时间：{s.CheckedAtUtc:yyyy-MM-dd HH:mm}）";
     }
 
     private async Task RefreshTelegramStatus(Account account)

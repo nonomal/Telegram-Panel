@@ -46,11 +46,13 @@ public class AccountTelegramToolsService
 
             if (self == null)
             {
-                return new TelegramAccountStatusResult(
+                var missingProfile = new TelegramAccountStatusResult(
                     Ok: false,
                     Summary: "无法获取账号资料",
                     Details: "Users_GetUsers(Self) 未返回 User",
                     CheckedAtUtc: checkedAt);
+                await TryPersistStatusAsync(accountId, missingProfile);
+                return missingProfile;
             }
 
             var profile = new TelegramAccountProfile(
@@ -71,7 +73,6 @@ public class AccountTelegramToolsService
             if (account != null)
             {
                 profile.ApplyTo(account);
-                await _accountManagement.UpdateAccountAsync(account);
             }
 
             var summary = "正常";
@@ -85,49 +86,83 @@ public class AccountTelegramToolsService
                 var probe = await ProbeCreateChannelCapabilityAsync(client, accountId);
                 if (probe.IsFrozen)
                 {
-                    return new TelegramAccountStatusResult(
+                    var frozen = new TelegramAccountStatusResult(
                         Ok: false,
                         Summary: "创建频道受限（冻结）",
                         Details: $"创建频道探测：{probe.Message}{Environment.NewLine}{BuildProfileDetails(profile)}",
                         CheckedAtUtc: checkedAt,
                         Profile: profile);
+                    await TryPersistStatusAsync(accountId, frozen, account, persistProfile: true);
+                    return frozen;
                 }
 
                 if (!probe.Success)
                 {
-                    return new TelegramAccountStatusResult(
+                    var failed = new TelegramAccountStatusResult(
                         Ok: false,
                         Summary: "创建频道探测失败",
                         Details: $"创建频道探测：{probe.Message}{Environment.NewLine}{BuildProfileDetails(profile)}",
                         CheckedAtUtc: checkedAt,
                         Profile: profile);
+                    await TryPersistStatusAsync(accountId, failed, account, persistProfile: true);
+                    return failed;
                 }
 
                 // 探测成功，不影响原状态，仅补充详情
-                return new TelegramAccountStatusResult(
+                var okWithProbe = new TelegramAccountStatusResult(
                     Ok: true,
                     Summary: summary,
                     Details: $"创建频道探测：可用（已自动清理测试频道）{Environment.NewLine}{BuildProfileDetails(profile)}",
                     CheckedAtUtc: checkedAt,
                     Profile: profile);
+                await TryPersistStatusAsync(accountId, okWithProbe, account, persistProfile: true);
+                return okWithProbe;
             }
 
-            return new TelegramAccountStatusResult(
+            var ok = new TelegramAccountStatusResult(
                 Ok: true,
                 Summary: summary,
                 Details: BuildProfileDetails(profile),
                 CheckedAtUtc: checkedAt,
                 Profile: profile);
+            await TryPersistStatusAsync(accountId, ok, account, persistProfile: true);
+            return ok;
         }
         catch (Exception ex)
         {
             var (summary, details) = MapTelegramException(ex);
             _logger.LogWarning(ex, "RefreshAccountStatus failed for account {AccountId}", accountId);
-            return new TelegramAccountStatusResult(
+            var failed = new TelegramAccountStatusResult(
                 Ok: false,
                 Summary: summary,
                 Details: details,
                 CheckedAtUtc: checkedAt);
+            await TryPersistStatusAsync(accountId, failed);
+            return failed;
+        }
+    }
+
+    private async Task TryPersistStatusAsync(int accountId, TelegramAccountStatusResult result, Account? account = null, bool persistProfile = false)
+    {
+        try
+        {
+            account ??= await _accountManagement.GetAccountAsync(accountId);
+            if (account == null)
+                return;
+
+            if (persistProfile && result.Profile != null)
+                result.Profile.ApplyTo(account);
+
+            account.TelegramStatusOk = result.Ok;
+            account.TelegramStatusSummary = result.Summary;
+            account.TelegramStatusDetails = result.Details;
+            account.TelegramStatusCheckedAtUtc = result.CheckedAtUtc;
+
+            await _accountManagement.UpdateAccountAsync(account);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist Telegram status cache for account {AccountId}", accountId);
         }
     }
 

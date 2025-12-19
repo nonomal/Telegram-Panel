@@ -21,6 +21,26 @@ public class Account
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime LastSyncAt { get; set; } = DateTime.UtcNow;
 
+    /// <summary>
+    /// Telegram 状态检测结果摘要（用于页面刷新后仍可展示上次检测结论）
+    /// </summary>
+    public string? TelegramStatusSummary { get; set; }
+
+    /// <summary>
+    /// Telegram 状态检测详情（错误码/原因等）
+    /// </summary>
+    public string? TelegramStatusDetails { get; set; }
+
+    /// <summary>
+    /// Telegram 状态检测是否成功（Ok）
+    /// </summary>
+    public bool? TelegramStatusOk { get; set; }
+
+    /// <summary>
+    /// Telegram 状态检测时间（UTC）
+    /// </summary>
+    public DateTime? TelegramStatusCheckedAtUtc { get; set; }
+
     // 导航属性
     public AccountCategory? Category { get; set; }
     public ICollection<Channel> Channels { get; set; } = new List<Channel>();
