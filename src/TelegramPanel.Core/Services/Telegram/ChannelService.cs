@@ -64,7 +64,7 @@ public class ChannelService : IChannelService
                         MemberCount = fullChannel.full_chat.ParticipantsCount,
                         About = (fullChannel.full_chat as ChannelFull)?.about,
                         CreatorAccountId = accountId,
-                        CreatedAt = channel.IsChannel ? null : channel.date,
+                        CreatedAt = channel.date,
                         SyncedAt = DateTime.UtcNow
                     });
                 }
@@ -113,6 +113,7 @@ public class ChannelService : IChannelService
             Title = channel.title,
             IsBroadcast = true,
             CreatorAccountId = accountId,
+            CreatedAt = channel.date,
             SyncedAt = DateTime.UtcNow
         };
     }
@@ -245,6 +246,102 @@ public class ChannelService : IChannelService
 
         // messages.toggleNoForwards: true 表示“保护内容”（禁止转发/保存）
         await client.Messages_ToggleNoForwards(channel, !allowed);
+        return true;
+    }
+
+    public async Task<List<ChannelAdminInfo>> GetAdminsAsync(int accountId, long channelId)
+    {
+        var client = await GetOrCreateConnectedClientAsync(accountId);
+        var channel = await GetChannelByIdAsync(client, channelId)
+            ?? throw new InvalidOperationException($"Channel {channelId} not found");
+
+        var participants = await client.Channels_GetParticipants(channel, new ChannelParticipantsAdmins());
+
+        var list = new List<ChannelAdminInfo>();
+        foreach (var p in participants.participants)
+        {
+            long userId;
+            string? rank = null;
+            var isCreator = p is ChannelParticipantCreator;
+
+            if (p is ChannelParticipantAdmin admin)
+            {
+                userId = admin.user_id;
+                rank = string.IsNullOrWhiteSpace(admin.rank) ? null : admin.rank;
+            }
+            else if (p is ChannelParticipantCreator creator)
+            {
+                userId = creator.user_id;
+                rank = string.IsNullOrWhiteSpace(creator.rank) ? null : creator.rank;
+            }
+            else
+            {
+                continue;
+            }
+
+            participants.users.TryGetValue(userId, out var u);
+            list.Add(new ChannelAdminInfo(
+                UserId: userId,
+                Username: u?.MainUsername,
+                FirstName: u?.first_name,
+                LastName: u?.last_name,
+                IsCreator: isCreator,
+                Rank: rank
+            ));
+        }
+
+        return list
+            .OrderByDescending(x => x.IsCreator)
+            .ThenBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    public async Task<bool> UpdateChannelInfoAsync(int accountId, long channelId, string title, string? about)
+    {
+        var client = await GetOrCreateConnectedClientAsync(accountId);
+        var channel = await GetChannelByIdAsync(client, channelId)
+            ?? throw new InvalidOperationException($"Channel {channelId} not found");
+
+        title = (title ?? string.Empty).Trim();
+        about = string.IsNullOrWhiteSpace(about) ? null : about.Trim();
+
+        if (string.IsNullOrWhiteSpace(title))
+            throw new ArgumentException("频道标题不能为空", nameof(title));
+
+        await client.Channels_EditTitle(channel, title);
+
+        if (about != null)
+            await client.Messages_EditChatAbout(channel, about);
+
+        return true;
+    }
+
+    public async Task<bool> KickUserAsync(int accountId, long channelId, string username, bool permanentBan = false)
+    {
+        var client = await GetOrCreateConnectedClientAsync(accountId);
+        var channel = await GetChannelByIdAsync(client, channelId)
+            ?? throw new InvalidOperationException($"Channel {channelId} not found");
+
+        username = (username ?? string.Empty).Trim().TrimStart('@');
+        if (string.IsNullOrWhiteSpace(username))
+            throw new ArgumentException("请输入要踢出的用户名", nameof(username));
+
+        var resolved = await client.Contacts_ResolveUsername(username);
+        var user = resolved.User;
+        if (user.access_hash == 0)
+            throw new InvalidOperationException("无法获取用户 access_hash，无法执行踢人");
+
+        var peer = new InputPeerUser(user.id, user.access_hash);
+
+        // 非永久：用短时间 ban 达到“踢出但可再加入”的效果
+        var until = permanentBan ? DateTime.UtcNow.AddYears(100) : DateTime.UtcNow.AddSeconds(60);
+        var rights = new ChatBannedRights
+        {
+            flags = ChatBannedRights.Flags.view_messages,
+            until_date = until
+        };
+
+        await client.Channels_EditBanned(channel, peer, rights);
         return true;
     }
 

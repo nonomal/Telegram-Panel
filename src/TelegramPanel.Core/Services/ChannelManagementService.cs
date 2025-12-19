@@ -58,6 +58,8 @@ public class ChannelManagementService
             existing.About = channel.About;
             existing.AccessHash = channel.AccessHash;
             existing.GroupId = channel.GroupId;
+            if (channel.CreatedAt.HasValue)
+                existing.CreatedAt = channel.CreatedAt;
             existing.SyncedAt = DateTime.UtcNow;
 
             await _channelRepository.UpdateAsync(existing);
@@ -69,6 +71,12 @@ public class ChannelManagementService
             channel.SyncedAt = DateTime.UtcNow;
             return await _channelRepository.AddAsync(channel);
         }
+    }
+
+    public async Task UpdateChannelAsync(Channel channel)
+    {
+        channel.SyncedAt = DateTime.UtcNow;
+        await _channelRepository.UpdateAsync(channel);
     }
 
     public async Task DeleteChannelAsync(int id)

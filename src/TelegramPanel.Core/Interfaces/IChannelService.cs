@@ -46,6 +46,21 @@ public interface IChannelService
     /// 设置是否允许转发（关闭后为“保护内容”，禁止转发/保存）
     /// </summary>
     Task<bool> SetForwardingAllowedAsync(int accountId, long channelId, bool allowed);
+
+    /// <summary>
+    /// 获取频道管理员列表
+    /// </summary>
+    Task<List<ChannelAdminInfo>> GetAdminsAsync(int accountId, long channelId);
+
+    /// <summary>
+    /// 编辑频道信息（标题/简介）
+    /// </summary>
+    Task<bool> UpdateChannelInfoAsync(int accountId, long channelId, string title, string? about);
+
+    /// <summary>
+    /// 从频道踢出用户（通过 username），可选是否永久封禁
+    /// </summary>
+    Task<bool> KickUserAsync(int accountId, long channelId, string username, bool permanentBan = false);
 }
 
 /// <summary>
