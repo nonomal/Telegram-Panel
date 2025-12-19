@@ -14,26 +14,42 @@ namespace TelegramPanel.Data.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            // 允许 Channels.CreatorAccountId 为空：用于“仅管理员（非本系统创建）”频道
-            migrationBuilder.DropForeignKey(
-                name: "FK_Channels_Accounts_CreatorAccountId",
-                table: "Channels");
+            // SQLite 不支持直接 DropForeignKey/AlterColumn（需要重建表）
+            migrationBuilder.Sql("PRAGMA foreign_keys=OFF;");
+            migrationBuilder.Sql(@"
+CREATE TABLE ""Channels__temp"" (
+    ""Id"" INTEGER NOT NULL CONSTRAINT ""PK_Channels"" PRIMARY KEY AUTOINCREMENT,
+    ""TelegramId"" INTEGER NOT NULL,
+    ""AccessHash"" INTEGER NULL,
+    ""Title"" TEXT NOT NULL,
+    ""Username"" TEXT NULL,
+    ""IsBroadcast"" INTEGER NOT NULL,
+    ""MemberCount"" INTEGER NOT NULL,
+    ""About"" TEXT NULL,
+    ""CreatorAccountId"" INTEGER NULL,
+    ""GroupId"" INTEGER NULL,
+    ""CreatedAt"" TEXT NULL,
+    ""SyncedAt"" TEXT NOT NULL,
+    CONSTRAINT ""FK_Channels_Accounts_CreatorAccountId"" FOREIGN KEY (""CreatorAccountId"") REFERENCES ""Accounts"" (""Id"") ON DELETE SET NULL,
+    CONSTRAINT ""FK_Channels_ChannelGroups_GroupId"" FOREIGN KEY (""GroupId"") REFERENCES ""ChannelGroups"" (""Id"") ON DELETE SET NULL
+);
+");
 
-            migrationBuilder.AlterColumn<int>(
-                name: "CreatorAccountId",
-                table: "Channels",
-                type: "INTEGER",
-                nullable: true,
-                oldClrType: typeof(int),
-                oldType: "INTEGER");
+            migrationBuilder.Sql(@"
+INSERT INTO ""Channels__temp"" (""Id"", ""TelegramId"", ""AccessHash"", ""Title"", ""Username"", ""IsBroadcast"", ""MemberCount"", ""About"", ""CreatorAccountId"", ""GroupId"", ""CreatedAt"", ""SyncedAt"")
+SELECT ""Id"", ""TelegramId"", ""AccessHash"", ""Title"", ""Username"", ""IsBroadcast"", ""MemberCount"", ""About"", ""CreatorAccountId"", ""GroupId"", ""CreatedAt"", ""SyncedAt""
+FROM ""Channels"";
+");
 
-            migrationBuilder.AddForeignKey(
-                name: "FK_Channels_Accounts_CreatorAccountId",
-                table: "Channels",
-                column: "CreatorAccountId",
-                principalTable: "Accounts",
-                principalColumn: "Id",
-                onDelete: ReferentialAction.SetNull);
+            migrationBuilder.Sql(@"DROP TABLE ""Channels"";");
+            migrationBuilder.Sql(@"ALTER TABLE ""Channels__temp"" RENAME TO ""Channels"";");
+
+            migrationBuilder.Sql(@"CREATE INDEX ""IX_Channels_CreatorAccountId"" ON ""Channels"" (""CreatorAccountId"");");
+            migrationBuilder.Sql(@"CREATE INDEX ""IX_Channels_GroupId"" ON ""Channels"" (""GroupId"");");
+            migrationBuilder.Sql(@"CREATE UNIQUE INDEX ""IX_Channels_TelegramId"" ON ""Channels"" (""TelegramId"");");
+            migrationBuilder.Sql(@"CREATE INDEX ""IX_Channels_Username"" ON ""Channels"" (""Username"");");
+
+            migrationBuilder.Sql("PRAGMA foreign_keys=ON;");
 
             migrationBuilder.CreateTable(
                 name: "AccountChannels",
@@ -90,28 +106,45 @@ WHERE CreatorAccountId IS NOT NULL;
             migrationBuilder.DropTable(
                 name: "AccountChannels");
 
-            migrationBuilder.DropForeignKey(
-                name: "FK_Channels_Accounts_CreatorAccountId",
-                table: "Channels");
+            migrationBuilder.Sql("PRAGMA foreign_keys=OFF;");
 
-            migrationBuilder.AlterColumn<int>(
-                name: "CreatorAccountId",
-                table: "Channels",
-                type: "INTEGER",
-                nullable: false,
-                defaultValue: 0,
-                oldClrType: typeof(int),
-                oldType: "INTEGER",
-                oldNullable: true);
+            // 回滚到“CreatorAccountId 必填”时，先移除新引入的“仅管理员频道”数据，避免不满足 NOT NULL
+            migrationBuilder.Sql(@"DELETE FROM ""Channels"" WHERE ""CreatorAccountId"" IS NULL;");
 
-            migrationBuilder.AddForeignKey(
-                name: "FK_Channels_Accounts_CreatorAccountId",
-                table: "Channels",
-                column: "CreatorAccountId",
-                principalTable: "Accounts",
-                principalColumn: "Id",
-                onDelete: ReferentialAction.Cascade);
+            migrationBuilder.Sql(@"
+CREATE TABLE ""Channels__temp"" (
+    ""Id"" INTEGER NOT NULL CONSTRAINT ""PK_Channels"" PRIMARY KEY AUTOINCREMENT,
+    ""TelegramId"" INTEGER NOT NULL,
+    ""AccessHash"" INTEGER NULL,
+    ""Title"" TEXT NOT NULL,
+    ""Username"" TEXT NULL,
+    ""IsBroadcast"" INTEGER NOT NULL,
+    ""MemberCount"" INTEGER NOT NULL,
+    ""About"" TEXT NULL,
+    ""CreatorAccountId"" INTEGER NOT NULL,
+    ""GroupId"" INTEGER NULL,
+    ""CreatedAt"" TEXT NULL,
+    ""SyncedAt"" TEXT NOT NULL,
+    CONSTRAINT ""FK_Channels_Accounts_CreatorAccountId"" FOREIGN KEY (""CreatorAccountId"") REFERENCES ""Accounts"" (""Id"") ON DELETE CASCADE,
+    CONSTRAINT ""FK_Channels_ChannelGroups_GroupId"" FOREIGN KEY (""GroupId"") REFERENCES ""ChannelGroups"" (""Id"") ON DELETE SET NULL
+);
+");
+
+            migrationBuilder.Sql(@"
+INSERT INTO ""Channels__temp"" (""Id"", ""TelegramId"", ""AccessHash"", ""Title"", ""Username"", ""IsBroadcast"", ""MemberCount"", ""About"", ""CreatorAccountId"", ""GroupId"", ""CreatedAt"", ""SyncedAt"")
+SELECT ""Id"", ""TelegramId"", ""AccessHash"", ""Title"", ""Username"", ""IsBroadcast"", ""MemberCount"", ""About"", ""CreatorAccountId"", ""GroupId"", ""CreatedAt"", ""SyncedAt""
+FROM ""Channels"";
+");
+
+            migrationBuilder.Sql(@"DROP TABLE ""Channels"";");
+            migrationBuilder.Sql(@"ALTER TABLE ""Channels__temp"" RENAME TO ""Channels"";");
+
+            migrationBuilder.Sql(@"CREATE INDEX ""IX_Channels_CreatorAccountId"" ON ""Channels"" (""CreatorAccountId"");");
+            migrationBuilder.Sql(@"CREATE INDEX ""IX_Channels_GroupId"" ON ""Channels"" (""GroupId"");");
+            migrationBuilder.Sql(@"CREATE UNIQUE INDEX ""IX_Channels_TelegramId"" ON ""Channels"" (""TelegramId"");");
+            migrationBuilder.Sql(@"CREATE INDEX ""IX_Channels_Username"" ON ""Channels"" (""Username"");");
+
+            migrationBuilder.Sql("PRAGMA foreign_keys=ON;");
         }
     }
 }
-
