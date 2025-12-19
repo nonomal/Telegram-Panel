@@ -1,0 +1,15 @@
+.git
+.serena
+.tmp
+**/bin
+**/obj
+docker-data
+logs
+sessions
+todolist
+*.db
+*.log
+*.user
+*.suo
+*.cache
+

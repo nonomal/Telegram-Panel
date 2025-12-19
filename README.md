@@ -315,8 +315,29 @@ dotnet run --project src/TelegramPanel.Web
 ### Docker 部署
 
 ```bash
-docker-compose up -d
+docker compose up -d --build
 ```
+
+启动后访问：`http://localhost:5000`
+
+#### 持久化数据目录
+
+默认通过 `docker-compose.yml` 把宿主机目录 `./docker-data` 挂载到容器 `/data`：
+
+- 数据库：`./docker-data/telegram-panel.db`
+- Sessions：`./docker-data/sessions/`
+- 系统设置本地覆盖（UI 保存 ApiId/ApiHash/同步开关等）：`./docker-data/appsettings.local.json`
+- 后台登录密码文件：`./docker-data/admin_auth.json`
+
+#### 常用环境变量（可选）
+
+在 `docker-compose.yml` 的 `environment` 中可调整：
+
+- `ConnectionStrings__DefaultConnection`：SQLite 路径（建议保持 `/data/telegram-panel.db`）
+- `Telegram__SessionsPath`：session 目录（建议保持 `/data/sessions`）
+- `AdminAuth__CredentialsPath`：后台密码文件（建议保持 `/data/admin_auth.json`）
+- `Sync__AutoSyncEnabled`：账号频道/群组数据自动同步（默认关闭）
+- `Telegram__BotAutoSyncEnabled`：Bot 频道自动同步轮询（默认关闭）
 
 ## 配置说明
 

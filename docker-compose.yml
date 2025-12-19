@@ -1,0 +1,30 @@
+services:
+  telegram-panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-panel
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./docker-data:/data
+    environment:
+      ASPNETCORE_URLS: "http://+:5000"
+      DOTNET_ENVIRONMENT: "Production"
+
+      # SQLite 数据库（持久化到 ./docker-data）
+      ConnectionStrings__DefaultConnection: "Data Source=/data/telegram-panel.db"
+
+      # Sessions（持久化到 ./docker-data/sessions）
+      Telegram__SessionsPath: "/data/sessions"
+
+      # 后台登录凭据文件（持久化到 ./docker-data/admin_auth.json）
+      AdminAuth__CredentialsPath: "/data/admin_auth.json"
+
+      # 默认关闭，避免频繁调用 Telegram API；可在系统设置里开启并保存到 /data/appsettings.local.json
+      Sync__AutoSyncEnabled: "false"
+
+      # 默认关闭 bot 轮询自动同步（需要时可手动同步）
+      Telegram__BotAutoSyncEnabled: "false"
+

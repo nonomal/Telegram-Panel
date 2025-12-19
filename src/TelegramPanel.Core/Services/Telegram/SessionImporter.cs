@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
 using TelegramPanel.Core.Interfaces;
 using WTelegram;
 
@@ -10,9 +11,11 @@ namespace TelegramPanel.Core.Services.Telegram;
 public class SessionImporter : ISessionImporter
 {
     private readonly ILogger<SessionImporter> _logger;
+    private readonly IConfiguration _configuration;
 
-    public SessionImporter(ILogger<SessionImporter> logger)
+    public SessionImporter(IConfiguration configuration, ILogger<SessionImporter> logger)
     {
+        _configuration = configuration;
         _logger = logger;
     }
 
@@ -47,12 +50,9 @@ public class SessionImporter : ISessionImporter
 
             // 复制到sessions目录
             var fileName = Path.GetFileName(filePath);
-            var targetPath = Path.Combine("sessions", fileName);
-
-            if (!Directory.Exists("sessions"))
-            {
-                Directory.CreateDirectory("sessions");
-            }
+            var sessionsPath = _configuration["Telegram:SessionsPath"] ?? "sessions";
+            Directory.CreateDirectory(sessionsPath);
+            var targetPath = Path.Combine(sessionsPath, fileName);
 
             File.Copy(filePath, targetPath, overwrite: true);
 
@@ -117,12 +117,9 @@ public class SessionImporter : ISessionImporter
             // 需要将base64字符串解码并保存为文件
 
             var sessionData = Convert.FromBase64String(sessionString);
-            var sessionPath = Path.Combine("sessions", $"{Guid.NewGuid()}.session");
-
-            if (!Directory.Exists("sessions"))
-            {
-                Directory.CreateDirectory("sessions");
-            }
+            var sessionsPath = _configuration["Telegram:SessionsPath"] ?? "sessions";
+            Directory.CreateDirectory(sessionsPath);
+            var sessionPath = Path.Combine(sessionsPath, $"{Guid.NewGuid()}.session");
 
             await File.WriteAllBytesAsync(sessionPath, sessionData);
 
@@ -141,7 +138,7 @@ public class SessionImporter : ISessionImporter
             if (client.User != null)
             {
                 // 重命名为手机号
-                var newPath = Path.Combine("sessions", $"{client.User.phone}.session");
+                var newPath = Path.Combine(sessionsPath, $"{client.User.phone}.session");
                 File.Move(sessionPath, newPath, overwrite: true);
 
                 return new ImportResult(
