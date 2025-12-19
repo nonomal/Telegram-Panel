@@ -599,9 +599,20 @@ public class AccountTelegramToolsService
             var client = await GetOrCreateConnectedClientAsync(accountId, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
 
-            // UploadFileAsync 会自动关闭/释放 stream
-            var inputFile = await client.UploadFileAsync(fileStream, fileName);
+            // 先拷贝到内存流再上传：避免某些浏览器/反代环境下 Stream 读取不稳定导致 Telegram 侧报 PHOTO_FILE_MISSING
+            // UploadFileAsync 会自动关闭/释放传入的 stream，这里传 MemoryStream 更可控。
+            await using var ms = new MemoryStream();
+            if (fileStream.CanSeek)
+                fileStream.Position = 0;
+
+            await fileStream.CopyToAsync(ms, cancellationToken);
+            ms.Position = 0;
+
+            var inputFile = await client.UploadFileAsync(ms, fileName);
             cancellationToken.ThrowIfCancellationRequested();
+
+            if (inputFile == null)
+                return (false, "头像上传失败：上传结果为空");
 
             await client.Photos_UploadProfilePhoto(inputFile, video: null, video_start_ts: null, video_emoji_markup: null, bot: null, fallback: false);
             return (true, null);
@@ -834,6 +845,9 @@ public class AccountTelegramToolsService
 
         if (msg.Contains("SESSION_PASSWORD_NEEDED", StringComparison.OrdinalIgnoreCase))
             return ("需要两步验证密码（SESSION_PASSWORD_NEEDED）", msg);
+
+        if (msg.Contains("PHOTO_FILE_MISSING", StringComparison.OrdinalIgnoreCase))
+            return ("头像上传失败（PHOTO_FILE_MISSING）", msg);
 
         if (msg.Contains("PHONE_NUMBER_BANNED", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("USER_DEACTIVATED_BAN", StringComparison.OrdinalIgnoreCase))
