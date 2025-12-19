@@ -17,7 +17,7 @@
         <MudTable Items="@filtered" Hover="true" Breakpoint="Breakpoint.Sm" Loading="@loading"
                   MultiSelection="true" @bind-SelectedItems="selected">
             <ToolBarContent>
-                <MudSelect Value="@selectedBotId" ValueChanged="OnSelectedBotChanged" Label="选择机器人"
+                <MudSelect T="int" Value="@selectedBotId" ValueChanged="@(async (int id) => await OnSelectedBotChanged(id))" Label="选择机器人"
                            Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 260px;">
                     <MudSelectItem Value="0">-- 请选择机器人 --</MudSelectItem>
                     @foreach (var b in bots)
