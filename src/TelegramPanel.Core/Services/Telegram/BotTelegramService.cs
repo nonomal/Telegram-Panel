@@ -52,7 +52,9 @@ public class BotTelegramService
         if (result.ValueKind != JsonValueKind.Array)
             return 0;
 
-        var applied = 0;
+        // Telegram 会针对同一个频道连续产生多条 my_chat_member（例如 member -> administrator），
+        // 这里按 chat_id 去重并只应用“最后一次状态”，避免“新增两个”的错觉/重复写库。
+        var changesByChatId = new Dictionary<long, BotChatMemberChange>();
         long? maxUpdateId = null;
 
         foreach (var update in result.EnumerateArray())
@@ -74,32 +76,44 @@ public class BotTelegramService
             if (!TryParseChatMemberUpdate(myChatMember, out var chat, out var status))
                 continue;
 
-            // channel/supergroup 才纳入列表
-            if (chat.Type is not ("channel" or "supergroup"))
+            // 仅同步“频道”（不包含群组/超级群组），避免把讨论群等误当成频道条目
+            if (chat.Type is not "channel")
                 continue;
 
-            if (status is "left" or "kicked")
+            changesByChatId[chat.Id] = new BotChatMemberChange(chat, status);
+        }
+
+        var affected = 0;
+        foreach (var kv in changesByChatId)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var chatId = kv.Key;
+            var change = kv.Value;
+
+            // 只把“具备管理员/创建者权限”的频道纳入 Bot 列表；
+            // left/kicked 或降权为 member 等，直接从列表移除（否则导出邀请会失败且列表不准）。
+            if (change.Status is "administrator" or "creator")
             {
-                await _botManagement.DeleteChannelByTelegramIdAsync(bot.Id, chat.Id);
-                applied++;
-                continue;
+                await _botManagement.UpsertChannelAsync(new BotChannel
+                {
+                    BotId = bot.Id,
+                    TelegramId = chatId,
+                    Title = string.IsNullOrWhiteSpace(change.Chat.Title) ? $"频道 {chatId}" : change.Chat.Title,
+                    Username = string.IsNullOrWhiteSpace(change.Chat.Username) ? null : change.Chat.Username.Trim().TrimStart('@'),
+                    IsBroadcast = true,
+                    MemberCount = 0,
+                    About = null,
+                    AccessHash = null,
+                    CreatedAt = null
+                });
+            }
+            else
+            {
+                await _botManagement.DeleteChannelByTelegramIdAsync(bot.Id, chatId);
             }
 
-            // member/administrator/creator -> upsert
-            await _botManagement.UpsertChannelAsync(new BotChannel
-            {
-                BotId = bot.Id,
-                TelegramId = chat.Id,
-                Title = string.IsNullOrWhiteSpace(chat.Title) ? $"频道 {chat.Id}" : chat.Title,
-                Username = string.IsNullOrWhiteSpace(chat.Username) ? null : chat.Username.Trim().TrimStart('@'),
-                IsBroadcast = chat.Type == "channel",
-                MemberCount = 0,
-                About = null,
-                AccessHash = null,
-                CreatedAt = null
-            });
-
-            applied++;
+            affected++;
         }
 
         if (maxUpdateId.HasValue)
@@ -107,7 +121,13 @@ public class BotTelegramService
         bot.LastSyncAt = DateTime.UtcNow;
         await _botManagement.UpdateBotAsync(bot);
 
-        return applied;
+        if (affected > 0)
+        {
+            var ids = string.Join(", ", changesByChatId.Keys.Take(5));
+            _logger.LogInformation("Bot {BotId} updates applied: affected {Affected} chats (first: {ChatIds})", botId, affected, ids);
+        }
+
+        return affected;
     }
 
     /// <summary>
@@ -192,6 +212,6 @@ public class BotTelegramService
         return true;
     }
 
+    private readonly record struct BotChatMemberChange(BotApiChat Chat, string Status);
     private readonly record struct BotApiChat(long Id, string Type, string? Title, string? Username);
 }
-

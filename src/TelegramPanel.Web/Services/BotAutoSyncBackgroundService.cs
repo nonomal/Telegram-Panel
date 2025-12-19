@@ -81,7 +81,10 @@ public class BotAutoSyncBackgroundService : BackgroundService
             try
             {
                 var count = await botTelegram.SyncBotChannelsAsync(bot.Id, cancellationToken);
-                _logger.LogInformation("Bot auto sync: bot {BotId} synced {Count} channels", bot.Id, count);
+                if (count > 0)
+                    _logger.LogInformation("Bot auto sync: bot {BotId} synced {Count} channels", bot.Id, count);
+                else
+                    _logger.LogDebug("Bot auto sync: bot {BotId} synced 0 channels", bot.Id);
             }
             catch (Exception ex)
             {
