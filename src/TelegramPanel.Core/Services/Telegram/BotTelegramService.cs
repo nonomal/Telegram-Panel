@@ -305,6 +305,8 @@ public class BotTelegramService
         if (userId <= 0)
             throw new ArgumentException("userId 无效", nameof(userId));
 
+        var botUserId = await GetBotUserIdAsync(bot.Token, cancellationToken);
+
         var ok = 0;
         foreach (var chatId in channelTelegramIds.Distinct())
         {
@@ -312,6 +314,10 @@ public class BotTelegramService
 
             try
             {
+                var (canPromote, reason) = await CanBotPromoteMembersAsync(bot.Token, chatId, botUserId, cancellationToken);
+                if (!canPromote)
+                    throw new InvalidOperationException(reason);
+
                 var args = new Dictionary<string, string?>
                 {
                     ["chat_id"] = chatId.ToString(),
@@ -414,4 +420,108 @@ public class BotTelegramService
         bool PinMessages,
         bool PromoteMembers
     );
+
+    public async Task<PromoteAdminsResult> PromoteChatMemberWithResultAsync(
+        int botId,
+        IReadOnlyList<long> channelTelegramIds,
+        long userId,
+        BotAdminRights rights,
+        CancellationToken cancellationToken)
+    {
+        var bot = await _botManagement.GetBotAsync(botId)
+            ?? throw new InvalidOperationException($"机器人不存在：{botId}");
+
+        if (!bot.IsActive)
+            throw new InvalidOperationException("该机器人已停用");
+
+        if (userId <= 0)
+            throw new ArgumentException("userId 无效", nameof(userId));
+
+        var distinctIds = channelTelegramIds.Distinct().ToList();
+        var failures = new Dictionary<long, string>();
+
+        var botUserId = await GetBotUserIdAsync(bot.Token, cancellationToken);
+
+        var ok = 0;
+        foreach (var chatId in distinctIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var (canPromote, reason) = await CanBotPromoteMembersAsync(bot.Token, chatId, botUserId, cancellationToken);
+                if (!canPromote)
+                    throw new InvalidOperationException(reason);
+
+                var args = new Dictionary<string, string?>
+                {
+                    ["chat_id"] = chatId.ToString(),
+                    ["user_id"] = userId.ToString(),
+                    ["can_manage_chat"] = rights.ManageChat ? "true" : "false",
+                    ["can_post_messages"] = rights.PostMessages ? "true" : "false",
+                    ["can_edit_messages"] = rights.EditMessages ? "true" : "false",
+                    ["can_delete_messages"] = rights.DeleteMessages ? "true" : "false",
+                    ["can_invite_users"] = rights.InviteUsers ? "true" : "false",
+                    ["can_restrict_members"] = rights.RestrictMembers ? "true" : "false",
+                    ["can_pin_messages"] = rights.PinMessages ? "true" : "false",
+                    ["can_promote_members"] = rights.PromoteMembers ? "true" : "false"
+                };
+
+                await _api.CallAsync(bot.Token, "promoteChatMember", args, cancellationToken);
+                ok++;
+            }
+            catch (Exception ex)
+            {
+                var msg = ex.Message;
+                failures[chatId] = msg;
+                _logger.LogWarning(ex, "PromoteChatMember failed for bot {BotId} chat {ChatId} user {UserId}", botId, chatId, userId);
+            }
+        }
+
+        return new PromoteAdminsResult(ok, distinctIds.Count, failures);
+    }
+
+    public sealed record PromoteAdminsResult(int SuccessCount, int TotalCount, IReadOnlyDictionary<long, string> Failures);
+
+    private async Task<long> GetBotUserIdAsync(string token, CancellationToken cancellationToken)
+    {
+        var me = await _api.CallAsync(token, "getMe", new Dictionary<string, string?>(), cancellationToken);
+        if (me.ValueKind != JsonValueKind.Object)
+            throw new InvalidOperationException("Bot API getMe 返回格式异常");
+        if (!me.TryGetProperty("id", out var idEl) || !idEl.TryGetInt64(out var id))
+            throw new InvalidOperationException("Bot API getMe 缺少 id");
+        return id;
+    }
+
+    private async Task<(bool CanPromote, string Reason)> CanBotPromoteMembersAsync(string token, long chatId, long botUserId, CancellationToken cancellationToken)
+    {
+        var member = await _api.CallAsync(token, "getChatMember", new Dictionary<string, string?>
+        {
+            ["chat_id"] = chatId.ToString(),
+            ["user_id"] = botUserId.ToString()
+        }, cancellationToken);
+
+        if (member.ValueKind != JsonValueKind.Object)
+            return (false, "无法检测机器人权限（getChatMember 返回格式异常）");
+
+        var status = member.TryGetProperty("status", out var statusEl) ? (statusEl.GetString() ?? "") : "";
+        if (string.Equals(status, "creator", StringComparison.OrdinalIgnoreCase))
+            return (true, "");
+
+        if (!string.Equals(status, "administrator", StringComparison.OrdinalIgnoreCase))
+            return (false, "机器人不是管理员（请先把机器人设为管理员）");
+
+        var canPromote = ReadBool(member, "can_promote_members");
+        if (!canPromote)
+            return (false, "机器人缺少“添加管理员”权限（请在频道管理员设置里给机器人开启“添加管理员/添加新管理员”）");
+
+        return (true, "");
+    }
+
+    private static bool ReadBool(JsonElement obj, string name)
+    {
+        return obj.TryGetProperty(name, out var el)
+            && (el.ValueKind == JsonValueKind.True || el.ValueKind == JsonValueKind.False)
+            && el.GetBoolean();
+    }
 }

@@ -1,12 +1,13 @@
 @namespace TelegramPanel.Web.Components.Dialogs
 @inject TelegramPanel.Core.Services.Telegram.BotTelegramService BotTelegram
 @inject ISnackbar Snackbar
+@using System.Linq
 
 <MudDialog>
     <DialogContent>
         <MudStack Spacing="2">
             <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
-                请输入要设置为管理员的 Telegram 用户 ID（不是手机号/用户名）。机器人需要在目标频道具备“添加管理员”权限。
+                请输入要设置为管理员的 Telegram 用户 ID（不是手机号/用户名）。机器人需要在目标频道具备“添加管理员/添加新管理员”权限，否则会失败。
             </MudAlert>
 
             <MudNumericField T="long?" @bind-Value="userId" Label="用户 ID" Variant="Variant.Outlined" Min="1" Required="true" />
@@ -40,7 +41,7 @@
             </MudGrid>
 
             <MudText Typo="Typo.caption" Color="Color.Secondary">
-                将对已选频道批量执行 promoteChatMember；失败的频道会被跳过（你可以在日志中查看原因）。
+                将对已选频道批量执行 promoteChatMember；失败会给出原因（常见：机器人不是管理员/缺少“添加管理员”权限/目标用户不在频道内）。
             </MudText>
         </MudStack>
     </DialogContent>
@@ -104,7 +105,7 @@
         saving = true;
         try
         {
-            var ok = await BotTelegram.PromoteChatMemberAsync(
+            var result = await BotTelegram.PromoteChatMemberWithResultAsync(
                 botId: BotId,
                 channelTelegramIds: ChannelTelegramIds,
                 userId: userId.Value,
@@ -121,8 +122,24 @@
                 cancellationToken: CancellationToken.None
             );
 
-            Snackbar.Add($"已设置管理员：成功 {ok}/{ChannelTelegramIds.Distinct().Count()} 个频道", ok > 0 ? Severity.Success : Severity.Warning);
-            MudDialog.Close(DialogResult.Ok(ok));
+            if (result.SuccessCount == 0)
+            {
+                var first = result.Failures.Values.FirstOrDefault() ?? "未知原因";
+                Snackbar.Add($"设置失败：{first}", Severity.Error);
+                return;
+            }
+
+            if (result.Failures.Count > 0)
+            {
+                var first = result.Failures.Values.FirstOrDefault() ?? "未知原因";
+                Snackbar.Add($"部分失败：成功 {result.SuccessCount}/{result.TotalCount}，示例原因：{first}", Severity.Warning);
+            }
+            else
+            {
+                Snackbar.Add($"已设置管理员：成功 {result.SuccessCount}/{result.TotalCount} 个频道", Severity.Success);
+            }
+
+            MudDialog.Close(DialogResult.Ok(result.SuccessCount));
         }
         catch (Exception ex)
         {
@@ -151,4 +168,3 @@
         public bool PromoteMembers { get; set; }
     }
 }
-
