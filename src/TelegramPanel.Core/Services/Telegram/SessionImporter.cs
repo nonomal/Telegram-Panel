@@ -16,7 +16,12 @@ public class SessionImporter : ISessionImporter
         _logger = logger;
     }
 
-    public async Task<ImportResult> ImportFromSessionFileAsync(string filePath, int apiId, string apiHash)
+    public async Task<ImportResult> ImportFromSessionFileAsync(
+        string filePath,
+        int apiId,
+        string apiHash,
+        long? userId = null,
+        string? phoneHint = null)
     {
         if (!File.Exists(filePath))
         {
@@ -26,6 +31,19 @@ public class SessionImporter : ISessionImporter
         try
         {
             _logger.LogInformation("Importing session from file: {FilePath}", filePath);
+
+            // 一些来源的 .session 实际上是 SQLite 格式（常见于 Telegram Desktop 导出）
+            // WTelegramClient 无法直接使用这类 session，用户应使用带 json 的压缩包导入或重新登录生成新 session。
+            if (LooksLikeSqliteSession(filePath))
+            {
+                return new ImportResult(
+                    false,
+                    phoneHint,
+                    userId,
+                    null,
+                    null,
+                    "该 .session 为 SQLite 格式（通常来自 Telegram Desktop），本项目不支持直接导入单个 .session；请使用包含 .json + .session 的压缩包导入，或重新登录生成新的 session。");
+            }
 
             // 复制到sessions目录
             var fileName = Path.GetFileName(filePath);
@@ -166,6 +184,23 @@ public class SessionImporter : ISessionImporter
         catch
         {
             return Task.FromResult(false);
+        }
+    }
+
+    private static bool LooksLikeSqliteSession(string filePath)
+    {
+        try
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            Span<byte> header = stackalloc byte[16];
+            var read = fs.Read(header);
+            if (read < 15) return false;
+            var text = System.Text.Encoding.ASCII.GetString(header[..15]);
+            return string.Equals(text, "SQLite format 3", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
         }
     }
 }

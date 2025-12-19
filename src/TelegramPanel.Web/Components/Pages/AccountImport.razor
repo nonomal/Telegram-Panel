@@ -8,6 +8,46 @@
 <MudText Typo="Typo.h4" Class="mb-4">导入账号</MudText>
 
 <MudGrid>
+    <MudItem xs="12">
+        <MudCard Class="mb-4">
+            <MudCardHeader>
+                <MudText Typo="Typo.h6">压缩包导入（推荐）</MudText>
+            </MudCardHeader>
+            <MudCardContent>
+                <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
+                    支持导入账号压缩包：每个账号一个文件夹，文件夹内包含一个 <strong>.json</strong> + 一个 <strong>.session</strong>。
+                </MudAlert>
+
+                <MudFileUpload T="IReadOnlyList<IBrowserFile>" FilesChanged="OnZipFilesChanged" Accept=".zip" MaximumFileCount="1">
+                    <ActivatorContent>
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Material.Filled.FolderZip" Class="mt-3">
+                            选择 Zip 压缩包
+                        </MudButton>
+                    </ActivatorContent>
+                </MudFileUpload>
+
+                @if (zipFile != null)
+                {
+                    <MudText Typo="Typo.body2" Class="mt-3">已选择：@zipFile.Name（@zipFile.Size bytes）</MudText>
+                }
+
+                <MudButton Variant="Variant.Filled" Color="Color.Success" FullWidth="true"
+                           Disabled="@(zipFile == null || importingZip)" Class="mt-4"
+                           OnClick="@(async (MouseEventArgs _) => await ImportZip())">
+                    @if (importingZip)
+                    {
+                        <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-2" />
+                        <span>导入中...</span>
+                    }
+                    else
+                    {
+                        <span>开始导入 Zip</span>
+                    }
+                </MudButton>
+            </MudCardContent>
+        </MudCard>
+    </MudItem>
+
     <MudItem xs="12" md="6">
         <MudCard>
             <MudCardHeader>
@@ -35,7 +75,7 @@
 
                 <MudButton Variant="Variant.Filled" Color="Color.Success" FullWidth="true"
                            Disabled="@(!selectedFiles.Any() || importing)" Class="mt-4"
-                           OnClick="ImportSessionFiles">
+                           OnClick="@(async (MouseEventArgs _) => await ImportSessionFiles())">
                     @if (importing)
                     {
                         <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-2" />
@@ -61,7 +101,7 @@
 
                 <MudButton Variant="Variant.Filled" Color="Color.Success" FullWidth="true"
                            Disabled="@(string.IsNullOrEmpty(sessionString) || importingString)" Class="mt-4"
-                           OnClick="ImportStringSession">
+                           OnClick="@(async (MouseEventArgs _) => await ImportStringSession())">
                     @if (importingString)
                     {
                         <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-2" />
@@ -112,6 +152,9 @@
     private List<IBrowserFile> selectedFiles = new();
     private bool importing = false;
 
+    private IBrowserFile? zipFile;
+    private bool importingZip = false;
+
     private string sessionString = "";
     private bool importingString = false;
 
@@ -128,6 +171,47 @@
     private void OnFilesChanged(IReadOnlyList<IBrowserFile> files)
     {
         selectedFiles = files.ToList();
+    }
+
+    private void OnZipFilesChanged(IReadOnlyList<IBrowserFile> files)
+    {
+        zipFile = files.FirstOrDefault();
+    }
+
+    private async Task ImportZip()
+    {
+        if (zipFile == null)
+        {
+            Snackbar.Add("请先选择 Zip 压缩包", Severity.Error);
+            return;
+        }
+
+        importingZip = true;
+        importResults.Clear();
+
+        try
+        {
+            var results = await AccountImportService.ImportFromZipAsync(zipFile);
+            importResults.AddRange(results);
+
+            var successCount = results.Count(r => r.Success);
+            var failureCount = results.Count - successCount;
+
+            if (successCount > 0)
+                Snackbar.Add($"成功导入 {successCount} 个账号", Severity.Success);
+            if (failureCount > 0)
+                Snackbar.Add($"{failureCount} 个账号导入失败", Severity.Warning);
+
+            zipFile = null;
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"导入失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            importingZip = false;
+        }
     }
 
     private async Task ImportSessionFiles()

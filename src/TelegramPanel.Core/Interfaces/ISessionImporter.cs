@@ -10,12 +10,20 @@ public interface ISessionImporter
     /// <summary>
     /// 从Session文件导入
     /// </summary>
-    Task<ImportResult> ImportFromSessionFileAsync(string filePath, int apiId, string apiHash);
+    Task<ImportResult> ImportFromSessionFileAsync(
+        string filePath,
+        int apiId,
+        string apiHash,
+        long? userId = null,
+        string? phoneHint = null);
 
     /// <summary>
     /// 批量导入Session文件
     /// </summary>
-    Task<List<ImportResult>> BatchImportSessionFilesAsync(string[] filePaths, int apiId, string apiHash);
+    Task<List<ImportResult>> BatchImportSessionFilesAsync(
+        string[] filePaths,
+        int apiId,
+        string apiHash);
 
     /// <summary>
     /// 从StringSession导入
