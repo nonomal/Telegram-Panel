@@ -124,7 +124,23 @@ public class GroupService : IGroupService
 
         var absoluteSessionPath = Path.GetFullPath(account.SessionPath);
         if (System.IO.File.Exists(absoluteSessionPath) && LooksLikeSqliteSession(absoluteSessionPath))
-            throw new InvalidOperationException($"该账号的 Session 文件为 SQLite 格式（常见于 Telethon/Pyrogram/Telegram Desktop）：{account.SessionPath}。本项目基于 WTelegramClient，无法直接复用该格式；请到【账号-手机号登录】重新登录生成新的 sessions/*.session 后再操作。");
+        {
+            var ok = await SessionDataConverter.TryConvertSessionFromSessionDataAsync(
+                phone: account.Phone,
+                apiId: account.ApiId,
+                apiHash: account.ApiHash,
+                targetSessionPath: absoluteSessionPath,
+                logger: _logger
+            );
+
+            if (!ok)
+            {
+                throw new InvalidOperationException(
+                    $"该账号的 Session 文件为 SQLite 格式：{account.SessionPath}，本项目无法直接复用。" +
+                    "已尝试从仓库根目录 `session数据/<手机号>/*.json` 读取 session_string 自动转换但失败；" +
+                    "请到【账号-手机号登录】重新登录生成新的 sessions/*.session 后再操作。");
+            }
+        }
 
         await _clientPool.RemoveClientAsync(accountId);
         var client = await _clientPool.GetOrCreateClientAsync(accountId, account.ApiId, account.ApiHash, account.SessionPath);
@@ -162,18 +178,6 @@ public class GroupService : IGroupService
 
     private static bool LooksLikeSqliteSession(string filePath)
     {
-        try
-        {
-            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            Span<byte> header = stackalloc byte[16];
-            var read = fs.Read(header);
-            if (read < 15) return false;
-            var text = System.Text.Encoding.ASCII.GetString(header[..15]);
-            return string.Equals(text, "SQLite format 3", StringComparison.Ordinal);
-        }
-        catch
-        {
-            return false;
-        }
+        return SessionDataConverter.LooksLikeSqliteSession(filePath);
     }
 }
