@@ -1,0 +1,128 @@
+@namespace TelegramPanel.Web.Components.Dialogs
+@inject BotManagementService BotManagement
+@inject TelegramPanel.Core.Services.Telegram.BotTelegramService BotTelegram
+@inject ISnackbar Snackbar
+@using TelegramPanel.Data.Entities
+
+<MudDialog>
+    <DialogContent>
+        @if (loading)
+        {
+            <MudProgressLinear Indeterminate="true" />
+        }
+        else
+        {
+            <MudStack Spacing="2">
+                <MudTextField @bind-Value="title" Label="频道标题" Variant="Variant.Outlined" Required="true" />
+                <MudTextField @bind-Value="about" Label="频道简介（可选）" Variant="Variant.Outlined" Lines="4" />
+            </MudStack>
+        }
+    </DialogContent>
+    <DialogActions>
+        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="Cancel" Disabled="@saving">取消</MudButton>
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="Save" Disabled="@saving">
+            @if (saving)
+            {
+                <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-2" />
+                <span>保存中...</span>
+            }
+            else
+            {
+                <span>保存</span>
+            }
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code
+{
+    [CascadingParameter] private MudDialogInstance MudDialog { get; set; } = default!;
+    [Parameter] public int BotId { get; set; }
+    [Parameter] public long ChannelTelegramId { get; set; }
+
+    private bool loading = true;
+    private bool saving;
+
+    private string title = "";
+    private string about = "";
+    private TelegramPanel.Core.Services.Telegram.BotTelegramService.BotChatInfo? chatInfo;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        loading = true;
+        try
+        {
+            chatInfo = await BotTelegram.GetChatInfoAsync(BotId, ChannelTelegramId, CancellationToken.None);
+            title = chatInfo.Title ?? "";
+            about = chatInfo.Description ?? "";
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"加载失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            loading = false;
+        }
+    }
+
+    private async Task Save()
+    {
+        if (saving)
+            return;
+
+        title = (title ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            Snackbar.Add("频道标题不能为空", Severity.Warning);
+            return;
+        }
+
+        saving = true;
+        try
+        {
+            var normalizedAbout = string.IsNullOrWhiteSpace(about) ? null : about.Trim();
+            await BotTelegram.UpdateChannelInfoAsync(BotId, ChannelTelegramId, title, normalizedAbout, CancellationToken.None);
+
+            // 同步回本地 DB（用于列表展示）
+            var dbChannel = await BotManagement.GetChannelByTelegramIdAsync(BotId, ChannelTelegramId);
+            var username = chatInfo?.Username ?? dbChannel?.Username;
+            var memberCount = chatInfo?.MemberCount ?? dbChannel?.MemberCount ?? 0;
+
+            await BotManagement.UpsertChannelAsync(new BotChannel
+            {
+                BotId = BotId,
+                TelegramId = ChannelTelegramId,
+                Title = title,
+                Username = username,
+                IsBroadcast = true,
+                MemberCount = memberCount,
+                About = normalizedAbout,
+                AccessHash = dbChannel?.AccessHash,
+                CreatedAt = dbChannel?.CreatedAt
+            });
+
+            Snackbar.Add("保存成功", Severity.Success);
+            MudDialog.Close(DialogResult.Ok(true));
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            saving = false;
+        }
+    }
+
+    private void Cancel()
+    {
+        MudDialog.Cancel();
+    }
+}
+

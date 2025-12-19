@@ -373,15 +373,33 @@
 
     private async Task ShowDetailsAsync(BotChannel channel)
     {
-        // 详情弹窗在下一步实现，这里先占位避免空点击
-        Snackbar.Add("Bot 频道详情开发中…", Severity.Info);
+        if (selectedBotId <= 0)
+            return;
+
+        var parameters = new DialogParameters
+        {
+            ["BotId"] = selectedBotId,
+            ["ChannelTelegramId"] = channel.TelegramId
+        };
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Large, FullWidth = true };
+        DialogService.Show<BotChannelDetailsDialog>("频道详情", parameters, options);
         await Task.CompletedTask;
     }
 
     private async Task EditChannelAsync(BotChannel channel)
     {
-        // 编辑弹窗在下一步实现，这里先占位避免空点击
-        Snackbar.Add("Bot 频道编辑开发中…", Severity.Info);
-        await Task.CompletedTask;
+        if (selectedBotId <= 0)
+            return;
+
+        var parameters = new DialogParameters
+        {
+            ["BotId"] = selectedBotId,
+            ["ChannelTelegramId"] = channel.TelegramId
+        };
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Medium, FullWidth = true };
+        var dialog = DialogService.Show<BotChannelEditDialog>("编辑频道", parameters, options);
+        var result = await dialog.Result;
+        if (!result.Canceled)
+            await LoadBotData();
     }
 }

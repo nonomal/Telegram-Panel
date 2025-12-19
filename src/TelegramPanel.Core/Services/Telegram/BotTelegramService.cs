@@ -168,6 +168,132 @@ public class BotTelegramService
         throw new InvalidOperationException("无法获取邀请链接（可能无权限/被限制）");
     }
 
+    public async Task<BotChatInfo> GetChatInfoAsync(int botId, long channelTelegramId, CancellationToken cancellationToken)
+    {
+        var bot = await _botManagement.GetBotAsync(botId)
+            ?? throw new InvalidOperationException($"机器人不存在：{botId}");
+
+        if (!bot.IsActive)
+            throw new InvalidOperationException("该机器人已停用");
+
+        var chat = await _api.CallAsync(bot.Token, "getChat", new Dictionary<string, string?>
+        {
+            ["chat_id"] = channelTelegramId.ToString()
+        }, cancellationToken);
+
+        if (chat.ValueKind != JsonValueKind.Object)
+            throw new InvalidOperationException("无法获取频道信息（返回格式异常）");
+
+        var type = chat.TryGetProperty("type", out var typeEl) ? (typeEl.GetString() ?? "") : "";
+        var title = chat.TryGetProperty("title", out var titleEl) ? titleEl.GetString() : null;
+        var username = chat.TryGetProperty("username", out var usernameEl) ? usernameEl.GetString() : null;
+        var description = chat.TryGetProperty("description", out var descEl) ? descEl.GetString() : null;
+
+        int? memberCount = null;
+        try
+        {
+            var countEl = await _api.CallAsync(bot.Token, "getChatMemberCount", new Dictionary<string, string?>
+            {
+                ["chat_id"] = channelTelegramId.ToString()
+            }, cancellationToken);
+            if (countEl.ValueKind == JsonValueKind.Number && countEl.TryGetInt32(out var c))
+                memberCount = c;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "getChatMemberCount failed for bot {BotId} chat {ChatId}", botId, channelTelegramId);
+        }
+
+        return new BotChatInfo(
+            TelegramId: channelTelegramId,
+            Type: type,
+            Title: title,
+            Username: string.IsNullOrWhiteSpace(username) ? null : username.Trim().TrimStart('@'),
+            Description: string.IsNullOrWhiteSpace(description) ? null : description.Trim(),
+            MemberCount: memberCount
+        );
+    }
+
+    public async Task<List<BotChatAdminInfo>> GetChatAdminsAsync(int botId, long channelTelegramId, CancellationToken cancellationToken)
+    {
+        var bot = await _botManagement.GetBotAsync(botId)
+            ?? throw new InvalidOperationException($"机器人不存在：{botId}");
+
+        if (!bot.IsActive)
+            throw new InvalidOperationException("该机器人已停用");
+
+        var result = await _api.CallAsync(bot.Token, "getChatAdministrators", new Dictionary<string, string?>
+        {
+            ["chat_id"] = channelTelegramId.ToString()
+        }, cancellationToken);
+
+        if (result.ValueKind != JsonValueKind.Array)
+            return new List<BotChatAdminInfo>();
+
+        var list = new List<BotChatAdminInfo>();
+        foreach (var el in result.EnumerateArray())
+        {
+            if (el.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var status = el.TryGetProperty("status", out var statusEl) ? (statusEl.GetString() ?? "") : "";
+            var customTitle = el.TryGetProperty("custom_title", out var ctEl) ? ctEl.GetString() : null;
+
+            if (!el.TryGetProperty("user", out var userEl) || userEl.ValueKind != JsonValueKind.Object)
+                continue;
+
+            if (!userEl.TryGetProperty("id", out var idEl) || !idEl.TryGetInt64(out var userId))
+                continue;
+
+            var username = userEl.TryGetProperty("username", out var uEl) ? uEl.GetString() : null;
+            var firstName = userEl.TryGetProperty("first_name", out var fnEl) ? fnEl.GetString() : null;
+            var lastName = userEl.TryGetProperty("last_name", out var lnEl) ? lnEl.GetString() : null;
+
+            list.Add(new BotChatAdminInfo(
+                UserId: userId,
+                Username: string.IsNullOrWhiteSpace(username) ? null : username.Trim().TrimStart('@'),
+                FirstName: firstName,
+                LastName: lastName,
+                Status: status,
+                CustomTitle: string.IsNullOrWhiteSpace(customTitle) ? null : customTitle.Trim()
+            ));
+        }
+
+        return list
+            .OrderByDescending(x => x.IsCreator)
+            .ThenBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    public async Task<bool> UpdateChannelInfoAsync(int botId, long channelTelegramId, string title, string? about, CancellationToken cancellationToken)
+    {
+        var bot = await _botManagement.GetBotAsync(botId)
+            ?? throw new InvalidOperationException($"机器人不存在：{botId}");
+
+        if (!bot.IsActive)
+            throw new InvalidOperationException("该机器人已停用");
+
+        title = (title ?? string.Empty).Trim();
+        about = string.IsNullOrWhiteSpace(about) ? null : about.Trim();
+
+        if (string.IsNullOrWhiteSpace(title))
+            throw new ArgumentException("频道标题不能为空", nameof(title));
+
+        await _api.CallAsync(bot.Token, "setChatTitle", new Dictionary<string, string?>
+        {
+            ["chat_id"] = channelTelegramId.ToString(),
+            ["title"] = title
+        }, cancellationToken);
+
+        await _api.CallAsync(bot.Token, "setChatDescription", new Dictionary<string, string?>
+        {
+            ["chat_id"] = channelTelegramId.ToString(),
+            ["description"] = about ?? ""
+        }, cancellationToken);
+
+        return true;
+    }
+
     public async Task<IReadOnlyDictionary<long, string>> ExportInviteLinksAsync(int botId, IReadOnlyList<long> channelTelegramIds, CancellationToken cancellationToken)
     {
         var map = new Dictionary<long, string>();
@@ -218,4 +344,19 @@ public class BotTelegramService
 
     private readonly record struct BotChatMemberChange(BotApiChat Chat, string Status);
     private readonly record struct BotApiChat(long Id, string Type, string? Title, string? Username);
+
+    public sealed record BotChatInfo(long TelegramId, string Type, string? Title, string? Username, string? Description, int? MemberCount);
+
+    public sealed record BotChatAdminInfo(long UserId, string? Username, string? FirstName, string? LastName, string Status, string? CustomTitle)
+    {
+        public bool IsCreator => string.Equals(Status, "creator", StringComparison.OrdinalIgnoreCase);
+        public string DisplayName
+        {
+            get
+            {
+                var name = $"{FirstName} {LastName}".Trim();
+                return string.IsNullOrWhiteSpace(name) ? (Username ?? UserId.ToString()) : name;
+            }
+        }
+    }
 }

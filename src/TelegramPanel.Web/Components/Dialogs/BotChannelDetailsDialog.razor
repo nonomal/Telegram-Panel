@@ -1,0 +1,202 @@
+@namespace TelegramPanel.Web.Components.Dialogs
+@inject BotManagementService BotManagement
+@inject TelegramPanel.Core.Services.Telegram.BotTelegramService BotTelegram
+@inject ISnackbar Snackbar
+@inject IDialogService DialogService
+@inject IJSRuntime JS
+@using TelegramPanel.Data.Entities
+
+<MudDialog>
+    <DialogContent>
+        @if (loading)
+        {
+            <MudProgressLinear Indeterminate="true" />
+        }
+        else if (chatInfo == null)
+        {
+            <MudAlert Severity="Severity.Error" Variant="Variant.Outlined">未找到频道信息</MudAlert>
+        }
+        else
+        {
+            <MudStack Spacing="2">
+                <MudText Typo="Typo.h6">@((chatInfo.Title ?? dbChannel?.Title) ?? $"频道 {ChannelTelegramId}")</MudText>
+
+                <MudGrid>
+                    <MudItem xs="12" md="6">
+                        <MudText Typo="Typo.body2"><strong>TelegramId：</strong>@chatInfo.TelegramId</MudText>
+                        <MudText Typo="Typo.body2"><strong>用户名：</strong>@(string.IsNullOrWhiteSpace(chatInfo.Username) ? "（私密）" : "@" + chatInfo.Username)</MudText>
+                        <MudText Typo="Typo.body2"><strong>成员数：</strong>@(chatInfo.MemberCount?.ToString() ?? (dbChannel?.MemberCount.ToString() ?? "-"))</MudText>
+                    </MudItem>
+                    <MudItem xs="12" md="6">
+                        <MudText Typo="Typo.body2"><strong>机器人：</strong>@(bot == null ? $"Bot {BotId}" : bot.Name)</MudText>
+                        <MudText Typo="Typo.body2"><strong>最后同步：</strong>@(dbChannel?.SyncedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "-")</MudText>
+                        <MudText Typo="Typo.body2"><strong>分类：</strong>@(dbChannel?.Category?.Name ?? "未分类")</MudText>
+                    </MudItem>
+                </MudGrid>
+
+                @if (!string.IsNullOrWhiteSpace(chatInfo.Description) || !string.IsNullOrWhiteSpace(dbChannel?.About))
+                {
+                    <MudText Typo="Typo.body2"><strong>简介：</strong></MudText>
+                    <MudPaper Class="pa-3" Elevation="0" Style="background: rgba(0,0,0,0.03);">
+                        <MudText Typo="Typo.body2" Style="white-space: pre-wrap;">@(chatInfo.Description ?? dbChannel?.About)</MudText>
+                    </MudPaper>
+                }
+
+                <MudDivider />
+
+                <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="2">
+                    <MudText Typo="Typo.h6">管理员</MudText>
+                    <MudSpacer />
+                    <MudButton Variant="Variant.Outlined" Color="Color.Primary" StartIcon="@Icons.Material.Filled.Refresh"
+                               Disabled="@adminsLoading" OnClick="LoadAdmins">
+                        刷新
+                    </MudButton>
+                </MudStack>
+
+                @if (adminsLoading)
+                {
+                    <MudProgressLinear Indeterminate="true" />
+                }
+                else if (admins.Count == 0)
+                {
+                    <MudText Typo="Typo.body2" Color="Color.Secondary">暂无管理员数据（或无权限获取）</MudText>
+                }
+                else
+                {
+                    <MudTable Items="@admins" Dense="true" Hover="true" Breakpoint="Breakpoint.Sm">
+                        <HeaderContent>
+                            <MudTh>身份</MudTh>
+                            <MudTh>昵称</MudTh>
+                            <MudTh>用户名</MudTh>
+                            <MudTh>头衔</MudTh>
+                        </HeaderContent>
+                        <RowTemplate>
+                            <MudTd DataLabel="身份">
+                                <MudChip T="string" Size="Size.Small" Color="@(context.IsCreator ? Color.Success : Color.Default)">
+                                    @(context.IsCreator ? "创建者" : "管理员")
+                                </MudChip>
+                            </MudTd>
+                            <MudTd DataLabel="昵称">@context.DisplayName</MudTd>
+                            <MudTd DataLabel="用户名">@(!string.IsNullOrWhiteSpace(context.Username) ? "@" + context.Username : "-")</MudTd>
+                            <MudTd DataLabel="头衔">@(string.IsNullOrWhiteSpace(context.CustomTitle) ? "-" : context.CustomTitle)</MudTd>
+                        </RowTemplate>
+                    </MudTable>
+                }
+            </MudStack>
+        }
+    </DialogContent>
+    <DialogActions>
+        @if (chatInfo != null)
+        {
+            <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="CopyLink">复制链接</MudButton>
+            <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="OpenEdit">编辑频道</MudButton>
+        }
+        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="Close">关闭</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code
+{
+    [CascadingParameter] private MudDialogInstance MudDialog { get; set; } = default!;
+    [Parameter] public int BotId { get; set; }
+    [Parameter] public long ChannelTelegramId { get; set; }
+
+    private bool loading = true;
+    private Bot? bot;
+    private BotChannel? dbChannel;
+    private TelegramPanel.Core.Services.Telegram.BotTelegramService.BotChatInfo? chatInfo;
+
+    private bool adminsLoading;
+    private List<TelegramPanel.Core.Services.Telegram.BotTelegramService.BotChatAdminInfo> admins = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadInfo();
+        await LoadAdmins();
+    }
+
+    private async Task LoadInfo()
+    {
+        loading = true;
+        try
+        {
+            bot = await BotManagement.GetBotAsync(BotId);
+            dbChannel = await BotManagement.GetChannelByTelegramIdAsync(BotId, ChannelTelegramId);
+            chatInfo = await BotTelegram.GetChatInfoAsync(BotId, ChannelTelegramId, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"加载频道详情失败：{ex.Message}", Severity.Error);
+            chatInfo = null;
+        }
+        finally
+        {
+            loading = false;
+        }
+    }
+
+    private async Task LoadAdmins()
+    {
+        if (chatInfo == null)
+            return;
+
+        adminsLoading = true;
+        try
+        {
+            admins = await BotTelegram.GetChatAdminsAsync(BotId, ChannelTelegramId, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            admins.Clear();
+            Snackbar.Add($"加载管理员失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            adminsLoading = false;
+        }
+    }
+
+    private async Task CopyLink()
+    {
+        if (chatInfo == null)
+            return;
+
+        try
+        {
+            var link = await BotTelegram.ExportInviteLinkAsync(BotId, ChannelTelegramId, CancellationToken.None);
+            await JS.InvokeVoidAsync("telegramPanel.copyText", link);
+            Snackbar.Add("已复制链接", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"复制失败：{ex.Message}", Severity.Error);
+        }
+    }
+
+    private async Task OpenEdit()
+    {
+        if (chatInfo == null)
+            return;
+
+        var parameters = new DialogParameters
+        {
+            ["BotId"] = BotId,
+            ["ChannelTelegramId"] = ChannelTelegramId
+        };
+
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Medium, FullWidth = true };
+        var dialog = DialogService.Show<BotChannelEditDialog>("编辑频道", parameters, options);
+        var result = await dialog.Result;
+        if (!result.Canceled)
+        {
+            await LoadInfo();
+            await LoadAdmins();
+        }
+    }
+
+    private void Close()
+    {
+        MudDialog.Close();
+    }
+}
+

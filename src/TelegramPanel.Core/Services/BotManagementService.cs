@@ -132,6 +132,11 @@ public class BotManagementService
         return list.Where(x => x.IsBroadcast);
     }
 
+    public async Task<BotChannel?> GetChannelByTelegramIdAsync(int botId, long telegramId)
+    {
+        return await _botChannelRepository.GetByTelegramIdAsync(botId, telegramId);
+    }
+
     public async Task<BotChannel> UpsertChannelAsync(BotChannel channel)
     {
         if (channel.BotId <= 0)
