@@ -1,5 +1,6 @@
 @page "/accounts/categories"
 @inject AccountCategoryManagementService CategoryManagement
+@inject AccountManagementService AccountManagement
 @inject ISnackbar Snackbar
 @inject IDialogService DialogService
 @using TelegramPanel.Data.Entities
@@ -62,6 +63,49 @@
                 </MudTable>
             </MudCardContent>
         </MudCard>
+
+        <MudCard Class="mt-4">
+            <MudCardHeader>
+                <MudText Typo="Typo.h6">分类绑定账号</MudText>
+            </MudCardHeader>
+            <MudCardContent>
+                <MudSelect @bind-Value="assignCategoryId" Label="选择分类" Variant="Variant.Outlined" Dense="true"
+                           @bind-Value:after="OnAssignCategoryChanged">
+                    <MudSelectItem Value="0">-- 请选择分类 --</MudSelectItem>
+                    @foreach (var c in categories)
+                    {
+                        <MudSelectItem Value="@c.Id">@c.Name</MudSelectItem>
+                    }
+                </MudSelect>
+
+                <MudTable Items="@accounts" Hover="true" Dense="true" Class="mt-3"
+                          MultiSelection="true" @bind-SelectedItems="selectedAccounts"
+                          Loading="@accountsLoading">
+                    <HeaderContent>
+                        <MudTh>手机号</MudTh>
+                        <MudTh>昵称</MudTh>
+                        <MudTh>用户名</MudTh>
+                        <MudTh>当前分类</MudTh>
+                    </HeaderContent>
+                    <RowTemplate>
+                        <MudTd DataLabel="手机号">@context.Phone</MudTd>
+                        <MudTd DataLabel="昵称">@(context.Nickname ?? "-")</MudTd>
+                        <MudTd DataLabel="用户名">@(context.Username ?? "-")</MudTd>
+                        <MudTd DataLabel="当前分类">@(context.Category?.Name ?? "未分类")</MudTd>
+                    </RowTemplate>
+                    <NoRecordsContent>
+                        <MudText>暂无账号数据</MudText>
+                    </NoRecordsContent>
+                </MudTable>
+            </MudCardContent>
+            <MudCardActions>
+                <MudButton Variant="Variant.Filled" Color="Color.Primary"
+                           Disabled="@(assignCategoryId == 0 || accountsLoading)"
+                           OnClick="@(async (MouseEventArgs _) => await SaveCategoryAssignments())">
+                    保存勾选到分类
+                </MudButton>
+            </MudCardActions>
+        </MudCard>
     </MudItem>
 </MudGrid>
 
@@ -72,9 +116,15 @@
     private List<AccountCategory> categories = new();
     private bool loading = true;
 
+    private List<Account> accounts = new();
+    private bool accountsLoading = true;
+    private int assignCategoryId = 0;
+    private HashSet<Account> selectedAccounts = new();
+
     protected override async Task OnInitializedAsync()
     {
         await LoadCategories();
+        await LoadAccounts();
     }
 
     private async Task LoadCategories()
@@ -95,6 +145,65 @@
         }
     }
 
+    private async Task LoadAccounts()
+    {
+        accountsLoading = true;
+        try
+        {
+            var list = await AccountManagement.GetAllAccountsAsync();
+            accounts = list.ToList();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"加载账号失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            accountsLoading = false;
+        }
+    }
+
+    private Task OnAssignCategoryChanged()
+    {
+        selectedAccounts = assignCategoryId <= 0
+            ? new HashSet<Account>()
+            : accounts.Where(a => a.CategoryId == assignCategoryId).ToHashSet();
+        return Task.CompletedTask;
+    }
+
+    private async Task SaveCategoryAssignments()
+    {
+        if (assignCategoryId <= 0)
+        {
+            Snackbar.Add("请选择分类", Severity.Error);
+            return;
+        }
+
+        try
+        {
+            var currentlyInCategory = accounts.Where(a => a.CategoryId == assignCategoryId).ToList();
+            var selected = selectedAccounts.ToHashSet();
+
+            foreach (var account in currentlyInCategory.Where(a => !selected.Contains(a)))
+            {
+                await AccountManagement.UpdateAccountCategoryAsync(account.Id, null);
+            }
+
+            foreach (var account in selected.Where(a => a.CategoryId != assignCategoryId))
+            {
+                await AccountManagement.UpdateAccountCategoryAsync(account.Id, assignCategoryId);
+            }
+
+            await LoadAccounts();
+            selectedAccounts = accounts.Where(a => a.CategoryId == assignCategoryId).ToHashSet();
+            Snackbar.Add("分类绑定已保存", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存失败：{ex.Message}", Severity.Error);
+        }
+    }
+
     private async Task AddCategory()
     {
         try
@@ -109,6 +218,7 @@
 
             await CategoryManagement.CreateCategoryAsync(category);
             await LoadCategories();
+            await LoadAccounts();
             Snackbar.Add($"分类 \"{newCategoryName}\" 添加成功", Severity.Success);
 
             newCategoryName = "";
@@ -134,6 +244,12 @@
             {
                 await CategoryManagement.DeleteCategoryAsync(category.Id);
                 categories.Remove(category);
+                if (assignCategoryId == category.Id)
+                {
+                    assignCategoryId = 0;
+                    selectedAccounts = new HashSet<Account>();
+                }
+                await LoadAccounts();
                 Snackbar.Add("删除成功", Severity.Success);
             }
             catch (Exception ex)

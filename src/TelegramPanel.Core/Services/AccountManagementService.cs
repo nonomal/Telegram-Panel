@@ -93,4 +93,14 @@ public class AccountManagementService
             await _accountRepository.UpdateAsync(account);
         }
     }
+
+    public async Task UpdateAccountCategoryAsync(int accountId, int? categoryId)
+    {
+        var account = await _accountRepository.GetByIdAsync(accountId);
+        if (account != null)
+        {
+            account.CategoryId = categoryId;
+            await _accountRepository.UpdateAsync(account);
+        }
+    }
 }

@@ -1,5 +1,6 @@
 @page "/accounts"
 @inject AccountManagementService AccountManagement
+@inject AccountCategoryManagementService CategoryManagement
 @inject ISnackbar Snackbar
 @inject IDialogService DialogService
 @using TelegramPanel.Data.Entities
@@ -14,6 +15,13 @@
             <ToolBarContent>
                 <MudText Typo="Typo.h6">已导入账号 (@accounts.Count)</MudText>
                 <MudSpacer />
+                <MudSelect @bind-Value="filterCategoryId" Label="分类" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 160px;">
+                    <MudSelectItem Value="0">全部分类</MudSelectItem>
+                    @foreach (var c in categories)
+                    {
+                        <MudSelectItem Value="@c.Id">@c.Name</MudSelectItem>
+                    }
+                </MudSelect>
                 <MudTextField @bind-Value="searchString" Placeholder="搜索账号..." Adornment="Adornment.Start"
                               AdornmentIcon="@Icons.Material.Filled.Search" IconSize="Size.Medium" Class="mt-0"
                               Immediate="true" />
@@ -80,21 +88,43 @@
 
 @code {
     private List<Account> accounts = new();
+    private List<AccountCategory> categories = new();
     private bool loading = true;
     private string searchString = "";
+    private int filterCategoryId = 0;
 
     private IEnumerable<Account> filteredAccounts =>
-        string.IsNullOrWhiteSpace(searchString)
-            ? accounts
-            : accounts.Where(a =>
-                a.Phone.Contains(searchString, StringComparison.OrdinalIgnoreCase) ||
-                (a.Nickname?.Contains(searchString, StringComparison.OrdinalIgnoreCase) ?? false) ||
-                (a.Username?.Contains(searchString, StringComparison.OrdinalIgnoreCase) ?? false) ||
-                a.UserId.ToString().Contains(searchString));
+        accounts.Where(a =>
+        {
+            if (filterCategoryId > 0 && a.CategoryId != filterCategoryId)
+                return false;
+
+            if (string.IsNullOrWhiteSpace(searchString))
+                return true;
+
+            return a.Phone.Contains(searchString, StringComparison.OrdinalIgnoreCase)
+                   || (a.Nickname?.Contains(searchString, StringComparison.OrdinalIgnoreCase) ?? false)
+                   || (a.Username?.Contains(searchString, StringComparison.OrdinalIgnoreCase) ?? false)
+                   || a.UserId.ToString().Contains(searchString);
+        });
 
     protected override async Task OnInitializedAsync()
     {
+        await LoadCategories();
         await LoadAccounts();
+    }
+
+    private async Task LoadCategories()
+    {
+        try
+        {
+            var list = await CategoryManagement.GetAllCategoriesAsync();
+            categories = list.ToList();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"加载分类失败：{ex.Message}", Severity.Error);
+        }
     }
 
     private async Task LoadAccounts()
@@ -104,6 +134,7 @@
         {
             var accountList = await AccountManagement.GetAllAccountsAsync();
             accounts = accountList.ToList();
+            await LoadCategories();
         }
         catch (Exception ex)
         {
