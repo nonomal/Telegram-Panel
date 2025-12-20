@@ -55,6 +55,8 @@
     {
         // 从配置文件读取用户的主题偏好
         _isDarkMode = await UiPreferences.GetIsDarkModeAsync();
+        // 确保初始化后 UI 能正确显示主题
+        StateHasChanged();
     }
 
     private void ToggleDrawer()
@@ -67,5 +69,7 @@
         _isDarkMode = !_isDarkMode;
         // 保存主题偏好到配置文件
         await UiPreferences.SetIsDarkModeAsync(_isDarkMode);
+        // 强制刷新组件状态，确保在异步操作后 UI 能及时更新
+        StateHasChanged();
     }
 }
