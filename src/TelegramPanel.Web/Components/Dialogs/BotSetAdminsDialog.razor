@@ -7,10 +7,21 @@
     <DialogContent>
         <MudStack Spacing="2">
             <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
-                请输入要设置为管理员的 Telegram 用户 ID（不是手机号/用户名）。机器人需要在目标频道具备“添加管理员/添加新管理员”权限，否则会失败。
+                请输入要设置为管理员的 Telegram 用户 ID（不是手机号/用户名）。机器人需要在目标频道具备"添加管理员/添加新管理员"权限，否则会失败。
             </MudAlert>
 
-            <MudNumericField T="long?" @bind-Value="userId" Label="用户 ID" Variant="Variant.Outlined" Min="1" Required="true" />
+            <MudTextField @bind-Value="userIdInput" Label="用户 ID" Variant="Variant.Outlined" Required="true"
+                          HelperText="输入 Telegram 用户 ID（纯数字）"
+                          Placeholder="例如: 123456789" />
+
+            <MudAlert Severity="Severity.Normal" Variant="Variant.Outlined" Dense="true">
+                <strong>如何获取用户 ID？</strong>
+                <ol style="margin: 8px 0 0 0; padding-left: 20px;">
+                    <li>打开网页版：登录 <a href="https://web.telegram.org" target="_blank" style="color: #1976d2;">Telegram 网页版 (web.telegram.org)</a></li>
+                    <li>找到联系人：点击进入你想查询的用户的私聊窗口</li>
+                    <li>查看链接：在浏览器地址栏中，链接最后的那串数字（如 web.telegram.org 中的 <code>123456789</code>）就是对方的 UserID</li>
+                </ol>
+            </MudAlert>
 
             <MudText Typo="Typo.subtitle2" Class="mt-2">权限</MudText>
             <MudGrid>
@@ -41,7 +52,7 @@
             </MudGrid>
 
             <MudText Typo="Typo.caption" Color="Color.Secondary">
-                将对已选频道批量执行 promoteChatMember；失败会给出原因（常见：机器人不是管理员/缺少“添加管理员”权限/目标用户不在频道内）。
+                将对已选频道批量执行 promoteChatMember；失败会给出原因（常见：机器人不是管理员/缺少"添加管理员"权限/目标用户不在频道内）。
             </MudText>
         </MudStack>
     </DialogContent>
@@ -67,14 +78,14 @@
     [Parameter] public int BotId { get; set; }
     [Parameter] public IReadOnlyList<long> ChannelTelegramIds { get; set; } = Array.Empty<long>();
 
-    private long? userId;
+    private string userIdInput = "";
     private bool saving;
 
     private RightsModel rights = new();
 
     protected override void OnInitialized()
     {
-        // 默认给出一个“常用”权限组合，减少操作成本
+        // 默认给出一个"常用"权限组合，减少操作成本
         rights.ManageChat = true;
         rights.InviteUsers = true;
     }
@@ -96,9 +107,16 @@
             return;
         }
 
-        if (userId is not > 0)
+        var input = (userIdInput ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(input))
         {
             Snackbar.Add("请输入用户 ID", Severity.Warning);
+            return;
+        }
+
+        if (!long.TryParse(input, out var userId) || userId <= 0)
+        {
+            Snackbar.Add("用户 ID 格式不正确（请输入纯数字）", Severity.Warning);
             return;
         }
 
@@ -108,7 +126,7 @@
             var result = await BotTelegram.PromoteChatMemberWithResultAsync(
                 botId: BotId,
                 channelTelegramIds: ChannelTelegramIds,
-                userId: userId.Value,
+                userId: userId,
                 rights: new TelegramPanel.Core.Services.Telegram.BotTelegramService.BotAdminRights(
                     ManageChat: rights.ManageChat,
                     PostMessages: rights.PostMessages,

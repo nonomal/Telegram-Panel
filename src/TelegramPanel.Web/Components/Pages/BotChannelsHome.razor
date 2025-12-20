@@ -70,6 +70,11 @@
                     批量设置分类（@selected.Count）
                 </MudButton>
 
+                <MudButton Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.PersonRemove" Class="ml-2"
+                           Disabled="@(loading || selectedBotId <= 0 || selected.Count == 0)" OnClick="OpenBanMember">
+                    踢出用户（@selected.Count）
+                </MudButton>
+
                 <MudButton Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Material.Filled.Refresh"
                            Disabled="@(loading || selectedBotId <= 0)" OnClick="LoadBotData" Class="ml-2">
                     刷新
@@ -434,6 +439,67 @@
             catch (Exception ex)
             {
                 Snackbar.Add($"批量设置失败：{ex.Message}", Severity.Error);
+            }
+            finally
+            {
+                loading = false;
+            }
+        }
+    }
+
+    private async Task OpenBanMember()
+    {
+        if (selectedBotId <= 0)
+            return;
+
+        if (selected.Count == 0)
+        {
+            Snackbar.Add("请先选择频道", Severity.Info);
+            return;
+        }
+
+        var parameters = new DialogParameters
+        {
+            ["SelectedCount"] = selected.Count
+        };
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Small, FullWidth = true };
+        var dialog = DialogService.Show<BotBanMemberDialog>("移除用户", parameters, options);
+        var result = await dialog.Result;
+
+        if (!result.Canceled && result.Data is BotBanMemberDialog.BanUserRequest request)
+        {
+            loading = true;
+            try
+            {
+                var channelTelegramIds = selected.Select(x => x.TelegramId).ToList();
+                var banResult = await BotTelegram.BanChatMemberAsync(
+                    selectedBotId,
+                    channelTelegramIds,
+                    request.UserId,
+                    request.PermanentBan,
+                    CancellationToken.None);
+
+                var actionText = request.PermanentBan ? "封禁" : "踢出";
+                if (banResult.Failures.Count == 0)
+                {
+                    Snackbar.Add($"已成功从 {banResult.SuccessCount} 个频道{actionText}用户 {request.UserId}", Severity.Success);
+                }
+                else
+                {
+                    var msg = $"成功：{banResult.SuccessCount} 个，失败：{banResult.Failures.Count} 个";
+                    if (banResult.Failures.Count > 0)
+                    {
+                        var firstError = banResult.Failures.First();
+                        msg += $"（首个失败原因：{firstError.Value}）";
+                    }
+                    Snackbar.Add(msg, Severity.Warning);
+                }
+
+                selected.Clear();
+            }
+            catch (Exception ex)
+            {
+                Snackbar.Add($"操作失败：{ex.Message}", Severity.Error);
             }
             finally
             {

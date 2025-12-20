@@ -524,4 +524,110 @@ public class BotTelegramService
             && (el.ValueKind == JsonValueKind.True || el.ValueKind == JsonValueKind.False)
             && el.GetBoolean();
     }
+
+    /// <summary>
+    /// 批量踢出/封禁频道成员
+    /// </summary>
+    /// <param name="permanentBan">true=永久封禁（无法再加入），false=仅踢出（可通过邀请链接重新加入）</param>
+    public async Task<BanMembersResult> BanChatMemberAsync(
+        int botId,
+        IReadOnlyList<long> channelTelegramIds,
+        long userId,
+        bool permanentBan,
+        CancellationToken cancellationToken)
+    {
+        var bot = await _botManagement.GetBotAsync(botId)
+            ?? throw new InvalidOperationException($"机器人不存在：{botId}");
+
+        if (!bot.IsActive)
+            throw new InvalidOperationException("该机器人已停用");
+
+        if (userId <= 0)
+            throw new ArgumentException("userId 无效", nameof(userId));
+
+        var distinctIds = channelTelegramIds.Distinct().ToList();
+        var failures = new Dictionary<long, string>();
+
+        var botUserId = await GetBotUserIdAsync(bot.Token, cancellationToken);
+
+        var ok = 0;
+        foreach (var chatId in distinctIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var (canBan, reason) = await CanBotBanMembersAsync(bot.Token, chatId, botUserId, cancellationToken);
+                if (!canBan)
+                    throw new InvalidOperationException(reason);
+
+                if (permanentBan)
+                {
+                    // 永久封禁：调用 banChatMember（默认永久封禁）
+                    var banArgs = new Dictionary<string, string?>
+                    {
+                        ["chat_id"] = chatId.ToString(),
+                        ["user_id"] = userId.ToString(),
+                        ["revoke_messages"] = "false" // 不撤回用户的历史消息
+                    };
+                    await _api.CallAsync(bot.Token, "banChatMember", banArgs, cancellationToken);
+                }
+                else
+                {
+                    // 仅踢出：先封禁再立即解封
+                    var banArgs = new Dictionary<string, string?>
+                    {
+                        ["chat_id"] = chatId.ToString(),
+                        ["user_id"] = userId.ToString(),
+                        ["revoke_messages"] = "false"
+                    };
+                    await _api.CallAsync(bot.Token, "banChatMember", banArgs, cancellationToken);
+
+                    var unbanArgs = new Dictionary<string, string?>
+                    {
+                        ["chat_id"] = chatId.ToString(),
+                        ["user_id"] = userId.ToString()
+                    };
+                    await _api.CallAsync(bot.Token, "unbanChatMember", unbanArgs, cancellationToken);
+                }
+
+                ok++;
+            }
+            catch (Exception ex)
+            {
+                var msg = ex.Message;
+                failures[chatId] = msg;
+                _logger.LogWarning(ex, "BanChatMember failed for bot {BotId} chat {ChatId} user {UserId} permanent {Permanent}", botId, chatId, userId, permanentBan);
+            }
+        }
+
+        return new BanMembersResult(ok, distinctIds.Count, failures);
+    }
+
+    public sealed record BanMembersResult(int SuccessCount, int TotalCount, IReadOnlyDictionary<long, string> Failures);
+
+    private async Task<(bool CanBan, string Reason)> CanBotBanMembersAsync(string token, long chatId, long botUserId, CancellationToken cancellationToken)
+    {
+        var member = await _api.CallAsync(token, "getChatMember", new Dictionary<string, string?>
+        {
+            ["chat_id"] = chatId.ToString(),
+            ["user_id"] = botUserId.ToString()
+        }, cancellationToken);
+
+        if (member.ValueKind != JsonValueKind.Object)
+            return (false, "无法检测机器人权限（getChatMember 返回格式异常）");
+
+        var status = member.TryGetProperty("status", out var statusEl) ? (statusEl.GetString() ?? "") : "";
+        if (string.Equals(status, "creator", StringComparison.OrdinalIgnoreCase))
+            return (true, "");
+
+        if (!string.Equals(status, "administrator", StringComparison.OrdinalIgnoreCase))
+            return (false, "机器人不是管理员（请先把机器人设为管理员）");
+
+        var canBan = ReadBool(member, "can_restrict_members");
+        if (!canBan)
+            return (false, "机器人缺少封禁用户权限（请在频道管理员设置里给机器人开启封禁用户权限）");
+
+        return (true, "");
+    }
 }

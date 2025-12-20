@@ -1,0 +1,91 @@
+@namespace TelegramPanel.Web.Components.Dialogs
+@using TelegramPanel.Data.Entities
+
+<MudDialog>
+    <DialogContent>
+        <MudStack Spacing="3">
+            <MudAlert Severity="Severity.Info">
+                将从 <strong>@SelectedCount</strong> 个频道移除指定用户
+            </MudAlert>
+
+            <MudTextField @bind-Value="userIdInput" Label="用户 ID" Variant="Variant.Outlined" Required="true"
+                          HelperText="输入要移除的 Telegram 用户 ID（纯数字）"
+                          Placeholder="例如: 123456789" />
+
+            <MudAlert Severity="Severity.Normal" Variant="Variant.Outlined" Dense="true">
+                <strong>如何获取用户 ID？</strong>
+                <ol style="margin: 8px 0 0 0; padding-left: 20px;">
+                    <li>打开网页版：登录 <a href="https://web.telegram.org" target="_blank" style="color: #1976d2;">Telegram 网页版 (web.telegram.org)</a></li>
+                    <li>找到联系人：点击进入你想查询的用户的私聊窗口</li>
+                    <li>查看链接：在浏览器地址栏中，链接最后的那串数字（如 web.telegram.org 中的 <code>123456789</code>）就是对方的 UserID</li>
+                </ol>
+            </MudAlert>
+
+            <MudRadioGroup @bind-Value="banMode">
+                <MudRadio Value="@BanMode.KickOnly" Color="Color.Primary">
+                    <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="1">
+                        <MudText Typo="Typo.body1"><strong>仅踢出</strong></MudText>
+                        <MudText Typo="Typo.body2" Color="Color.Default">
+                            （用户被移除，但可以通过邀请链接重新加入）
+                        </MudText>
+                    </MudStack>
+                </MudRadio>
+                <MudRadio Value="@BanMode.PermanentBan" Color="Color.Error">
+                    <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="1">
+                        <MudText Typo="Typo.body1"><strong>永久封禁</strong></MudText>
+                        <MudText Typo="Typo.body2" Color="Color.Default">
+                            （用户被封禁，无法再次加入频道）
+                        </MudText>
+                    </MudStack>
+                </MudRadio>
+            </MudRadioGroup>
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="Cancel">取消</MudButton>
+        <MudButton Variant="Variant.Filled" Color="@(banMode == BanMode.PermanentBan ? Color.Error : Color.Primary)" OnClick="Confirm">
+            @(banMode == BanMode.PermanentBan ? "永久封禁" : "踢出用户")
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code
+{
+    [CascadingParameter] private MudDialogInstance MudDialog { get; set; } = default!;
+    [Parameter] public int SelectedCount { get; set; }
+
+    private string userIdInput = "";
+    private BanMode banMode = BanMode.KickOnly;
+
+    private enum BanMode
+    {
+        KickOnly,       // 仅踢出
+        PermanentBan    // 永久封禁
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private void Confirm()
+    {
+        var input = (userIdInput ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            // 空输入直接取消
+            MudDialog.Cancel();
+            return;
+        }
+
+        if (!long.TryParse(input, out var userId) || userId <= 0)
+        {
+            // 无效的用户 ID，返回错误标记
+            MudDialog.Close(DialogResult.Cancel());
+            return;
+        }
+
+        // 返回用户ID和封禁模式
+        var result = new BanUserRequest(userId, banMode == BanMode.PermanentBan);
+        MudDialog.Close(DialogResult.Ok(result));
+    }
+
+    public record BanUserRequest(long UserId, bool PermanentBan);
+}
