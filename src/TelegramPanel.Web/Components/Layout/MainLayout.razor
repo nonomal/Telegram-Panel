@@ -1,7 +1,7 @@
 @inherits LayoutComponentBase
 @inject IJSRuntime JS
 
-<MudThemeProvider @bind-IsDarkMode="_isDarkMode" Theme="_theme" />
+<MudThemeProvider @bind-IsDarkMode="_isDarkMode" Theme="_theme" ObserveSystemThemeChange="false" />
 <MudPopoverProvider />
 <MudDialogProvider />
 <MudSnackbarProvider />
@@ -79,7 +79,7 @@
         }
     }
 
-    private async Task ToggleDarkMode()
+    private async Task ToggleDarkMode(MouseEventArgs _)
     {
         _isDarkMode = !_isDarkMode;
         try
