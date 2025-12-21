@@ -1,5 +1,7 @@
 namespace TelegramPanel.Web.ExternalApi;
 
+using System.Text.Json.Nodes;
+
 public static class ExternalApiTypes
 {
     public const string Kick = "kick";
@@ -13,7 +15,15 @@ public sealed class ExternalApiDefinition
     public bool Enabled { get; set; }
     public string ApiKey { get; set; } = "";
 
-    public KickApiDefinition Kick { get; set; } = new();
+    /// <summary>
+    /// 模块自定义配置（JSON object）。由具体 API 类型自行解释。
+    /// </summary>
+    public JsonObject Config { get; set; } = new();
+
+    /// <summary>
+    /// 兼容内置 kick 的强类型配置（建议同时写入 Config）。
+    /// </summary>
+    public KickApiDefinition? Kick { get; set; } = new();
 }
 
 public sealed class KickApiDefinition

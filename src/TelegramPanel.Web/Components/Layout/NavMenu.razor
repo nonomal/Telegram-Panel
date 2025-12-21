@@ -1,3 +1,5 @@
+@inject TelegramPanel.Web.Modules.ModuleContributionRegistry Contributions
+
 <MudNavMenu>
     <MudNavLink Href="/" Match="NavLinkMatch.All" Icon="@Icons.Material.Filled.Dashboard">
         仪表盘
@@ -38,6 +40,10 @@
         系统设置
     </MudNavLink>
 
+    <MudNavLink Href="/modules" Icon="@Icons.Material.Filled.Extension">
+        模块管理
+    </MudNavLink>
+
     <MudNavLink Href="/apis" Icon="@Icons.Material.Filled.Link">
         API 管理
     </MudNavLink>
@@ -49,4 +55,30 @@
     <MudNavLink Href="/logout" Icon="@Icons.Material.Filled.Logout">
         退出登录
     </MudNavLink>
+
+    @if (Contributions.NavItems.Count > 0 || Contributions.Pages.Count > 0)
+    {
+        <MudNavGroup Title="扩展模块" Icon="@Icons.Material.Filled.Extension">
+            @foreach (var item in Contributions.NavItems
+                .OrderBy(x => x.Definition.Group ?? "", StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Definition.Order)
+                .ThenBy(x => x.Definition.Title, StringComparer.OrdinalIgnoreCase))
+            {
+                <MudNavLink Href="@item.Definition.Href" Icon="@item.Definition.Icon">
+                    @item.Definition.Title
+                </MudNavLink>
+            }
+
+            @foreach (var modulePage in Contributions.Pages
+                .OrderBy(x => x.Definition.Group ?? "", StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Definition.Order)
+                .ThenBy(x => x.Definition.Title, StringComparer.OrdinalIgnoreCase))
+            {
+                var href = $"/ext/{modulePage.Module.Id}/{modulePage.Definition.Key}";
+                <MudNavLink Href="@href" Icon="@modulePage.Definition.Icon">
+                    @modulePage.Definition.Title
+                </MudNavLink>
+            }
+        </MudNavGroup>
+    }
 </MudNavMenu>

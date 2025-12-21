@@ -10,3 +10,4 @@
 - `docs/api.md`：接口速查（面向二次开发）
 - `docs/database.md`：数据库与主要表结构（面向排障/扩展）
 - `docs/advanced.md`：架构/配置项/环境变量/数据持久化位置等
+- `docs/modules.md`：模块系统（可安装/可卸载/版本与依赖/回滚）

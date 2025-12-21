@@ -20,6 +20,7 @@
   <ItemGroup>
     <ProjectReference Include="..\TelegramPanel.Core\TelegramPanel.Core.csproj" />
     <ProjectReference Include="..\TelegramPanel.Data\TelegramPanel.Data.csproj" />
+    <ProjectReference Include="..\TelegramPanel.Modules.Abstractions\TelegramPanel.Modules.Abstractions.csproj" />
   </ItemGroup>
 
 </Project>

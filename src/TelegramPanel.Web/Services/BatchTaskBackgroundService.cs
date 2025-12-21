@@ -7,6 +7,7 @@ using TelegramPanel.Core.Interfaces;
 using TelegramPanel.Core.Services;
 using TelegramPanel.Core.Services.Telegram;
 using TelegramPanel.Data.Entities;
+using TelegramPanel.Modules;
 
 namespace TelegramPanel.Web.Services;
 
@@ -102,11 +103,30 @@ public sealed class BatchTaskBackgroundService : BackgroundService
                     (completed, failed) = await RunUserJoinSubscribeAsync(pending, taskManagement, accountTelegramTools, completed, failed, cancellationToken);
                     break;
                 default:
-                    failed = pending.Total == 0 ? 1 : pending.Total;
-                    await taskManagement.UpdateTaskProgressAsync(pending.Id, completed, failed);
-                    await taskManagement.CompleteTaskAsync(pending.Id, success: false);
-                    _logger.LogWarning("Unsupported batch task type: {TaskType} (task {TaskId})", pending.TaskType, pending.Id);
-                    return;
+                    // 模块扩展任务：从 DI 中查找对应 TaskType 的执行器
+                    var handler = scope.ServiceProvider
+                        .GetServices<IModuleTaskHandler>()
+                        .FirstOrDefault(h => string.Equals(h.TaskType, pending.TaskType, StringComparison.OrdinalIgnoreCase));
+
+                    if (handler == null)
+                    {
+                        failed = pending.Total == 0 ? 1 : pending.Total;
+                        await taskManagement.UpdateTaskProgressAsync(pending.Id, completed, failed);
+                        await taskManagement.CompleteTaskAsync(pending.Id, success: false);
+                        _logger.LogWarning("Unsupported batch task type: {TaskType} (task {TaskId})", pending.TaskType, pending.Id);
+                        return;
+                    }
+
+                    var host = new DbBackedModuleTaskExecutionHost(pending, taskManagement, scope.ServiceProvider);
+                    await handler.ExecuteAsync(host, cancellationToken);
+
+                    var after = await taskManagement.GetTaskAsync(pending.Id);
+                    if (after != null)
+                    {
+                        completed = after.Completed;
+                        failed = after.Failed;
+                    }
+                    break;
             }
 
             // 如果任务被用户取消（当前实现：Cancel 会把状态写成 failed），则不覆盖它
@@ -310,4 +330,36 @@ public sealed class BatchTaskBackgroundService : BackgroundService
         List<string> Links,
         int DelayMs
     );
+
+    private sealed class DbBackedModuleTaskExecutionHost : IModuleTaskExecutionHost
+    {
+        private readonly BatchTask _task;
+        private readonly BatchTaskManagementService _taskManagement;
+
+        public DbBackedModuleTaskExecutionHost(BatchTask task, BatchTaskManagementService taskManagement, IServiceProvider services)
+        {
+            _task = task;
+            _taskManagement = taskManagement;
+            Services = services;
+        }
+
+        public int TaskId => _task.Id;
+        public string TaskType => _task.TaskType;
+        public int Total => _task.Total;
+        public string? Config => _task.Config;
+        public IServiceProvider Services { get; }
+
+        public async Task<bool> IsStillRunningAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var latest = await _taskManagement.GetTaskAsync(_task.Id);
+            return latest != null && latest.Status == "running";
+        }
+
+        public async Task UpdateProgressAsync(int completed, int failed, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await _taskManagement.UpdateTaskProgressAsync(_task.Id, completed, failed);
+        }
+    }
 }

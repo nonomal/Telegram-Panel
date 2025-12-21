@@ -1,0 +1,77 @@
+@page "/ext/{ModuleId}/{PageKey}"
+@using Microsoft.AspNetCore.Components
+@using TelegramPanel.Web.Modules
+@inject ModuleContributionRegistry Contributions
+
+<PageTitle>扩展页面 - Telegram Panel</PageTitle>
+
+@if (error != null)
+{
+    <MudAlert Severity="Severity.Error" Variant="Variant.Outlined">@error</MudAlert>
+}
+else if (componentType == null)
+{
+    <MudProgressCircular Indeterminate="true" />
+}
+else
+{
+    <DynamicComponent Type="componentType" Parameters="parameters" />
+}
+
+@code
+{
+    [Parameter] public string ModuleId { get; set; } = "";
+    [Parameter] public string PageKey { get; set; } = "";
+
+    private string? error;
+    private Type? componentType;
+    private Dictionary<string, object?> parameters = new();
+
+    protected override void OnParametersSet()
+    {
+        error = null;
+        componentType = null;
+        parameters = new Dictionary<string, object?>();
+
+        var moduleId = (ModuleId ?? "").Trim();
+        var pageKey = (PageKey ?? "").Trim();
+        if (moduleId.Length == 0 || pageKey.Length == 0)
+        {
+            error = "参数无效";
+            return;
+        }
+
+        var page = Contributions.Pages.FirstOrDefault(p =>
+            string.Equals(p.Module.Id, moduleId, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(p.Definition.Key, pageKey, StringComparison.OrdinalIgnoreCase));
+
+        if (page == null)
+        {
+            error = $"未找到扩展页面：{moduleId}/{pageKey}";
+            return;
+        }
+
+        var typeName = (page.Definition.ComponentType ?? "").Trim();
+        if (typeName.Length == 0)
+        {
+            error = "模块页面未配置 componentType";
+            return;
+        }
+
+        componentType =
+            Type.GetType(typeName, throwOnError: false, ignoreCase: false)
+            ?? page.Module.Instance.GetType().Assembly.GetType(typeName, throwOnError: false, ignoreCase: false);
+
+        if (componentType == null)
+        {
+            error = $"无法加载组件类型：{typeName}";
+            return;
+        }
+
+        parameters = new Dictionary<string, object?>
+        {
+            ["ModuleId"] = moduleId,
+            ["PageKey"] = pageKey
+        };
+    }
+}

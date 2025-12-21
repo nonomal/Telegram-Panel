@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
@@ -15,7 +16,7 @@ namespace TelegramPanel.Web.ExternalApi;
 
 public static class KickApi
 {
-    public static void MapKickApi(this WebApplication app)
+    public static void MapKickApi(this IEndpointRouteBuilder app)
     {
         app.MapPost("/api/kick", HandleAsync)
             .DisableAntiforgery()
@@ -53,6 +54,9 @@ public static class KickApi
                 new KickResponse(false, "X-API-Key 无效", new KickSummary(0, 0, 0), Array.Empty<KickResultItem>()),
                 statusCode: StatusCodes.Status401Unauthorized);
         }
+
+        matched.Kick ??= new KickApiDefinition();
+        matched.Kick.ChatIds ??= new List<long>();
 
         KickRequest? request;
         try

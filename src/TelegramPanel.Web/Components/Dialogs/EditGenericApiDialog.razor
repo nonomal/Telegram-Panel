@@ -1,0 +1,129 @@
+@namespace TelegramPanel.Web.Components.Dialogs
+@inject ISnackbar Snackbar
+@using System.Security.Cryptography
+@using System.Text.Json
+@using System.Text.Json.Nodes
+@using TelegramPanel.Web.ExternalApi
+
+<MudDialog>
+    <DialogContent>
+        <MudStack Spacing="2">
+            <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
+                外部接口：<b>@(string.IsNullOrWhiteSpace(Route) ? "-" : Route)</b>（Type: <b>@(string.IsNullOrWhiteSpace(Api.Type) ? "-" : Api.Type)</b>）
+            </MudAlert>
+
+            <MudTextField @bind-Value="model.Name" Label="API 名称" Variant="Variant.Outlined" Required="true" />
+
+            <MudSwitch @bind-Value="model.Enabled" Label="启用" Color="Color.Primary" />
+
+            <MudTextField @bind-Value="model.ApiKey" Label="X-API-Key" Variant="Variant.Outlined"
+                          HelperText="外部调用时传入请求头 X-API-Key" />
+            <MudButton Variant="Variant.Outlined" Color="Color.Primary" OnClick="RegenerateKey">
+                重新生成 Key
+            </MudButton>
+
+            <MudTextField @bind-Value="configJson" Label="Config（JSON 对象）" Variant="Variant.Outlined" Lines="10"
+                          HelperText="该 JSON 会写入 ExternalApi:Apis[].Config，由对应模块自行解析。若不需要配置可填 {}。" />
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="Cancel" Disabled="@saving">取消</MudButton>
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="Save" Disabled="@saving">
+            @if (saving)
+            {
+                <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-2" />
+                <span>保存中...</span>
+            }
+            else
+            {
+                <span>保存</span>
+            }
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code
+{
+    [CascadingParameter] private MudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter] public ExternalApiDefinition Api { get; set; } = new();
+    [Parameter] public string? Route { get; set; }
+
+    private bool saving;
+    private ExternalApiDefinition model = new();
+    private string configJson = "{}";
+
+    protected override void OnInitialized()
+    {
+        model = Clone(Api);
+        var cfg = model.Config ?? new JsonObject();
+        configJson = cfg.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private void RegenerateKey()
+    {
+        var bytes = RandomNumberGenerator.GetBytes(32);
+        var key = Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        model.ApiKey = key;
+        Snackbar.Add("已重新生成 Key（记得保存）", Severity.Info);
+    }
+
+    private void Save()
+    {
+        if (saving)
+            return;
+
+        var n = (model.Name ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(n))
+        {
+            Snackbar.Add("API 名称不能为空", Severity.Warning);
+            return;
+        }
+
+        var key = (model.ApiKey ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            Snackbar.Add("X-API-Key 不能为空", Severity.Warning);
+            return;
+        }
+
+        try
+        {
+            var parsed = JsonNode.Parse(configJson ?? "{}");
+            if (parsed is not JsonObject obj)
+            {
+                Snackbar.Add("Config 必须是 JSON 对象（例如 {}）", Severity.Warning);
+                return;
+            }
+
+            model.Name = n;
+            model.ApiKey = key;
+            model.Config = obj;
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Config JSON 无效：{ex.Message}", Severity.Warning);
+            return;
+        }
+
+        MudDialog.Close(DialogResult.Ok(model));
+    }
+
+    private static ExternalApiDefinition Clone(ExternalApiDefinition src)
+    {
+        // 仅用于编辑器内复制（避免直接改引用）
+        return new ExternalApiDefinition
+        {
+            Id = src.Id,
+            Name = src.Name,
+            Type = src.Type,
+            Enabled = src.Enabled,
+            ApiKey = src.ApiKey,
+            Kick = src.Kick,
+            Config = src.Config ?? new JsonObject()
+        };
+    }
+}
+

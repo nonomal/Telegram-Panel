@@ -9,6 +9,7 @@ using TelegramPanel.Core;
 using TelegramPanel.Core.Services;
 using TelegramPanel.Core.Services.Telegram;
 using TelegramPanel.Data;
+using TelegramPanel.Web.Modules;
 using TelegramPanel.Web.Services;
 using Microsoft.Extensions.Logging;
 
@@ -296,6 +297,7 @@ builder.Services.AddHostedService<BatchTaskBackgroundService>();
 builder.Services.AddHostedService<AccountDataAutoSyncBackgroundService>();
 builder.Services.AddHostedService<BotAutoSyncBackgroundService>();
 builder.Services.AddHttpClient<TelegramBotApiClient>();
+builder.Services.AddModuleSystem(builder.Configuration, builder.Environment);
 
 // 后台账号密码验证（Cookie 登录）
 builder.Services.Configure<AdminAuthOptions>(builder.Configuration.GetSection("AdminAuth"));
@@ -554,8 +556,8 @@ app.UseSerilogRequestLogging();
 app.UseAuthentication();
 app.UseAuthorization();
 
-// External API: /api/kick
-TelegramPanel.Web.ExternalApi.KickApi.MapKickApi(app);
+// Modules (built-in & installed): endpoints mapping
+app.MapInstalledModules();
 
 // 初始化后台登录凭据（首次启动会生成 admin_auth.json）
 var adminCredentials = app.Services.GetRequiredService<AdminCredentialStore>();

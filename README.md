@@ -259,3 +259,4 @@ curl -X POST "http://localhost:5000/api/kick" \
 - `docs/api.md`（接口速查）
 - `docs/database.md`（数据库/表结构说明）
 - `docs/advanced.md`（配置项/数据目录/后台任务等）
+- `docs/modules.md`（模块系统：可安装/可卸载/依赖/回滚）

@@ -7,7 +7,9 @@
 @inject IWebHostEnvironment Environment
 @using System.Text.Json
 @using System.Text.Json.Nodes
+@using TelegramPanel.Modules
 @using TelegramPanel.Web.ExternalApi
+@using TelegramPanel.Web.Modules
 @using TelegramPanel.Web.Services
 
 <PageTitle>API 管理 - Telegram Panel</PageTitle>
@@ -41,9 +43,16 @@
                 <MudTd DataLabel="类型">@GetTypeName(context.Type)</MudTd>
                 <MudTd DataLabel="接口">@(GetRoute(context.Type) ?? "-")</MudTd>
                 <MudTd DataLabel="状态">
-                    <MudChip T="string" Size="Size.Small" Color="@(context.Enabled ? Color.Success : Color.Default)">
-                        @(context.Enabled ? "启用" : "停用")
-                    </MudChip>
+                    @if (context.Enabled && !IsTypeAvailable(context.Type))
+                    {
+                        <MudChip T="string" Size="Size.Small" Color="Color.Warning">停止（模块停用）</MudChip>
+                    }
+                    else
+                    {
+                        <MudChip T="string" Size="Size.Small" Color="@(context.Enabled ? Color.Success : Color.Default)">
+                            @(context.Enabled ? "启用" : "停用")
+                        </MudChip>
+                    }
                 </MudTd>
                 <MudTd DataLabel="操作">
                     <MudIconButton Icon="@Icons.Material.Filled.Edit" Size="Size.Small" Color="Color.Info"
@@ -65,6 +74,7 @@
 {
     private bool loading = true;
     private List<ExternalApiDefinition> apis = new();
+    [Inject] private ModuleContributionRegistry Contributions { get; set; } = default!;
 
     private string LocalConfigPath => LocalConfigFile.ResolvePath(Configuration, Environment);
 
@@ -102,8 +112,13 @@
             a.Name = (a.Name ?? "").Trim();
             a.Type = (a.Type ?? "").Trim();
             a.ApiKey = (a.ApiKey ?? "").Trim();
-            a.Kick ??= new KickApiDefinition();
-            a.Kick.ChatIds ??= new List<long>();
+            a.Config ??= new JsonObject();
+
+            if (string.Equals(a.Type, ExternalApiTypes.Kick, StringComparison.OrdinalIgnoreCase))
+            {
+                a.Kick ??= new KickApiDefinition();
+                a.Kick.ChatIds ??= new List<long>();
+            }
         }
 
         return list
@@ -112,10 +127,34 @@
             .ToList();
     }
 
+    private bool IsTypeAvailable(string type)
+    {
+        return Contributions.ApiTypeToDefinition.ContainsKey(type);
+    }
+
+    private List<ModuleApiTypeDefinition> GetAvailableApiTypes()
+    {
+        return Contributions.ApiTypes
+            .OrderBy(x => x.Definition.Order)
+            .ThenBy(x => x.Definition.DisplayName)
+            .Select(x => x.Definition)
+            .ToList();
+    }
+
     private async Task CreateApi()
     {
+        var availableTypes = GetAvailableApiTypes();
+        if (availableTypes.Count == 0)
+        {
+            Snackbar.Add("当前没有可用的 API 类型（可能对应模块已停用）。请先到「模块管理」启用后重启。", Severity.Warning);
+            return;
+        }
+
         var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Small, FullWidth = true };
-        var dialog = DialogService.Show<TelegramPanel.Web.Components.Dialogs.CreateExternalApiDialog>("新建 API", new DialogParameters(), options)!;
+        var dialog = DialogService.Show<TelegramPanel.Web.Components.Dialogs.CreateExternalApiDialog>(
+            "新建 API",
+            new DialogParameters { ["AvailableTypes"] = availableTypes },
+            options)!;
         var result = await dialog.Result;
         if (result is null || result.Canceled || result.Data is not ExternalApiDefinition def)
             return;
@@ -141,6 +180,11 @@
 
     private async Task EditApi(ExternalApiDefinition api)
     {
+        if (!IsTypeAvailable(api.Type))
+        {
+            Snackbar.Add("该 API 类型对应模块已停用：当前配置不会生效（重启后仍不会提供接口）。", Severity.Warning);
+        }
+
         if (string.Equals(api.Type, ExternalApiTypes.Kick, StringComparison.OrdinalIgnoreCase))
         {
             var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Large, FullWidth = true };
@@ -163,7 +207,28 @@
             return;
         }
 
-        Snackbar.Add("该 API 类型暂未实现编辑器", Severity.Info);
+        {
+            var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Large, FullWidth = true };
+            var parameters = new DialogParameters
+            {
+                ["Api"] = api,
+                ["Route"] = GetRoute(api.Type)
+            };
+            var dialog = DialogService.Show<TelegramPanel.Web.Components.Dialogs.EditGenericApiDialog>("编辑 API", parameters, options)!;
+            var result = await dialog.Result;
+            if (result is null || result.Canceled || result.Data is not ExternalApiDefinition updated)
+                return;
+
+            if (apis.Any(a => a.Id != api.Id && string.Equals(a.ApiKey, updated.ApiKey, StringComparison.Ordinal)))
+            {
+                Snackbar.Add("X-API-Key 已存在，请更换后保存", Severity.Warning);
+                return;
+            }
+
+            ReplaceInList(updated);
+            await SaveToLocalConfigAsync(apis);
+            await Reload();
+        }
     }
 
     private async Task DeleteApi(ExternalApiDefinition api)
@@ -209,7 +274,11 @@
 
         var url = Navigation.ToAbsoluteUri(route).ToString();
 
-        var curl = $"curl -X POST \"{url}\" \\\n  -H \"Content-Type: application/json\" \\\n  -H \"X-API-Key: {key}\" \\\n  -d '{{\"user_id\": 123456789}}'";
+        var body = string.Equals(api.Type, ExternalApiTypes.Kick, StringComparison.OrdinalIgnoreCase)
+            ? "{\\\"user_id\\\": 123456789}"
+            : "{}";
+
+        var curl = $"curl -X POST \"{url}\" \\\n  -H \"Content-Type: application/json\" \\\n  -H \"X-API-Key: {key}\" \\\n  -d '{body}'";
 
         var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Medium, FullWidth = true };
         var parameters = new DialogParameters
@@ -219,17 +288,23 @@
         DialogService.Show<TelegramPanel.Web.Components.Dialogs.ExternalApiCurlSampleDialog>("调用示例（curl）", parameters, options);
     }
 
-    private static string GetTypeName(string type) => type switch
+    private string GetTypeName(string type)
     {
-        ExternalApiTypes.Kick => "踢人/封禁",
-        _ => string.IsNullOrWhiteSpace(type) ? "-" : type
-    };
+        if (string.IsNullOrWhiteSpace(type))
+            return "-";
+        return Contributions.ApiTypeToDefinition.TryGetValue(type, out var reg)
+            ? (string.IsNullOrWhiteSpace(reg.Definition.DisplayName) ? type : reg.Definition.DisplayName)
+            : type;
+    }
 
-    private static string? GetRoute(string type) => type switch
+    private string? GetRoute(string type)
     {
-        ExternalApiTypes.Kick => "/api/kick",
-        _ => null
-    };
+        if (string.IsNullOrWhiteSpace(type))
+            return null;
+        return Contributions.ApiTypeToDefinition.TryGetValue(type, out var reg)
+            ? (string.IsNullOrWhiteSpace(reg.Definition.Route) ? null : reg.Definition.Route)
+            : null;
+    }
 
     private async Task SaveToLocalConfigAsync(List<ExternalApiDefinition> list)
     {

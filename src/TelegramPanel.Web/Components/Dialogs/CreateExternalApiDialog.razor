@@ -1,6 +1,7 @@
 @namespace TelegramPanel.Web.Components.Dialogs
 @inject ISnackbar Snackbar
 @using System.Security.Cryptography
+@using TelegramPanel.Modules
 @using TelegramPanel.Web.ExternalApi
 
 <MudDialog>
@@ -14,7 +15,10 @@
                           HelperText="用于在面板中区分不同的 API 配置项" />
 
             <MudSelect @bind-Value="type" Label="API 类型" Variant="Variant.Outlined" Dense="true">
-                <MudSelectItem Value="@ExternalApiTypes.Kick">踢人/封禁（/api/kick）</MudSelectItem>
+                @foreach (var t in AvailableTypes)
+                {
+                    <MudSelectItem Value="@t.Type">@t.DisplayName（@t.Route）</MudSelectItem>
+                }
             </MudSelect>
 
             <MudSwitch @bind-Value="enabled" Label="立即启用" Color="Color.Primary" />
@@ -29,10 +33,17 @@
 @code
 {
     [CascadingParameter] private MudDialogInstance MudDialog { get; set; } = default!;
+    [Parameter] public IReadOnlyList<ModuleApiTypeDefinition> AvailableTypes { get; set; } = Array.Empty<ModuleApiTypeDefinition>();
 
     private string name = "";
-    private string type = ExternalApiTypes.Kick;
+    private string type = "";
     private bool enabled;
+
+    protected override void OnInitialized()
+    {
+        if (string.IsNullOrWhiteSpace(type))
+            type = AvailableTypes.FirstOrDefault()?.Type ?? "";
+    }
 
     private void Cancel() => MudDialog.Cancel();
 
@@ -45,6 +56,12 @@
             return;
         }
 
+        if (AvailableTypes.All(x => !string.Equals(x.Type, type, StringComparison.OrdinalIgnoreCase)))
+        {
+            Snackbar.Add("请选择有效的 API 类型", Severity.Warning);
+            return;
+        }
+
         var apiKey = GenerateKey();
         var def = new ExternalApiDefinition
         {
@@ -52,14 +69,19 @@
             Type = type,
             Enabled = enabled,
             ApiKey = apiKey,
-            Kick = new KickApiDefinition
+            Config = new System.Text.Json.Nodes.JsonObject()
+        };
+
+        if (string.Equals(type, ExternalApiTypes.Kick, StringComparison.OrdinalIgnoreCase))
+        {
+            def.Kick = new KickApiDefinition
             {
                 BotId = 0,
                 UseAllChats = true,
                 ChatIds = new List<long>(),
                 PermanentBanDefault = false
-            }
-        };
+            };
+        }
 
         MudDialog.Close(DialogResult.Ok(def));
     }
