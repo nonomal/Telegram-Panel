@@ -42,11 +42,16 @@
             @if (CurrentOption != null && !string.IsNullOrWhiteSpace(CurrentOption.CreateRoute))
             {
                 <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
-                    该任务建议使用独立页面创建：<b>@CurrentOption.CreateRoute</b>
+                    该任务建议使用配置窗口创建/编辑：<b>@CurrentOption.CreateRoute</b>
                 </MudAlert>
-                <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@(() => NavigateTo(CurrentOption.CreateRoute!))">
-                    前往创建
-                </MudButton>
+                <MudStack Row="true" Spacing="2">
+                    <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@(() => OpenCreateDialog(CurrentOption.CreateRoute!))">
+                        打开窗口
+                    </MudButton>
+                    <MudButton Variant="Variant.Outlined" Color="Color.Default" OnClick="@(() => NavigateTo(CurrentOption.CreateRoute!))">
+                        前往页面
+                    </MudButton>
+                </MudStack>
             }
             else if (CurrentOption != null && !string.IsNullOrWhiteSpace(CurrentOption.EditorComponentType) && editorComponentType != null)
             {
@@ -356,6 +361,52 @@
     {
         MudDialog.Close();
         Navigation.NavigateTo(url);
+    }
+
+    private async Task OpenCreateDialog(string route)
+    {
+        route = (route ?? "").Trim();
+        if (route.Length == 0)
+            return;
+
+        // 仅对模块扩展页面提供“窗口打开”：/ext/{ModuleId}/{PageKey}
+        if (!TryParseExtRoute(route, out var moduleId, out var pageKey))
+        {
+            Snackbar.Add("该任务未提供可窗口打开的模块页面，请使用“前往页面”。", Severity.Info);
+            return;
+        }
+
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.ExtraLarge, FullWidth = true };
+        var parameters = new DialogParameters
+        {
+            ["ModuleId"] = moduleId,
+            ["PageKey"] = pageKey
+        };
+
+        DialogService.Show<TelegramPanel.Web.Components.Dialogs.ModulePageDialog>("任务配置", parameters, options);
+        await Task.CompletedTask;
+    }
+
+    private static bool TryParseExtRoute(string route, out string moduleId, out string pageKey)
+    {
+        moduleId = "";
+        pageKey = "";
+
+        route = (route ?? "").Trim();
+        if (!route.StartsWith("/ext/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // /ext/{moduleId}/{pageKey}
+        var parts = route.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 3)
+            return false;
+
+        if (!string.Equals(parts[0], "ext", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        moduleId = parts[1];
+        pageKey = parts[2];
+        return moduleId.Length > 0 && pageKey.Length > 0;
     }
 
     private void Cancel() => MudDialog.Close();

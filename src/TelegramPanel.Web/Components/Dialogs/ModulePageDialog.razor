@@ -1,0 +1,101 @@
+@namespace TelegramPanel.Web.Components.Dialogs
+@using Microsoft.AspNetCore.Components
+@using TelegramPanel.Web.Modules
+@inject ModuleContributionRegistry Contributions
+
+<MudDialog>
+    <DialogContent>
+        @if (!string.IsNullOrWhiteSpace(error))
+        {
+            <MudAlert Severity="Severity.Error" Variant="Variant.Outlined">@error</MudAlert>
+        }
+        else if (componentType == null)
+        {
+            <MudProgressCircular Indeterminate="true" />
+        }
+        else
+        {
+            <DynamicComponent Type="componentType" Parameters="parameters" />
+        }
+    </DialogContent>
+    <DialogActions>
+        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="Close">关闭</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code
+{
+    [CascadingParameter] private MudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter] public string ModuleId { get; set; } = "";
+    [Parameter] public string PageKey { get; set; } = "";
+
+    private string? error;
+    private Type? componentType;
+    private Dictionary<string, object?> parameters = new();
+
+    protected override void OnParametersSet()
+    {
+        error = null;
+        componentType = null;
+        parameters = new Dictionary<string, object?>();
+
+        var moduleId = (ModuleId ?? "").Trim();
+        var pageKey = (PageKey ?? "").Trim();
+        if (moduleId.Length == 0 || pageKey.Length == 0)
+        {
+            error = "参数无效";
+            return;
+        }
+
+        var page = Contributions.Pages.FirstOrDefault(p =>
+            string.Equals(p.Module.Id, moduleId, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(p.Definition.Key, pageKey, StringComparison.OrdinalIgnoreCase));
+
+        if (page == null)
+        {
+            error = $"未找到扩展页面：{moduleId}/{pageKey}";
+            return;
+        }
+
+        var typeName = (page.Definition.ComponentType ?? "").Trim();
+        if (typeName.Length == 0)
+        {
+            error = "模块页面未配置 componentType";
+            return;
+        }
+
+        var moduleTypeName = NormalizeModuleTypeName(typeName);
+        componentType =
+            Type.GetType(typeName, throwOnError: false, ignoreCase: false)
+            ?? page.Module.Instance.GetType().Assembly.GetType(moduleTypeName, throwOnError: false, ignoreCase: false);
+
+        if (componentType == null)
+        {
+            error = $"无法加载组件类型：{typeName}";
+            return;
+        }
+
+        parameters = new Dictionary<string, object?>
+        {
+            ["ModuleId"] = moduleId,
+            ["PageKey"] = pageKey
+        };
+    }
+
+    private static string NormalizeModuleTypeName(string typeName)
+    {
+        typeName = (typeName ?? "").Trim();
+        if (typeName.Length == 0)
+            return typeName;
+
+        var comma = typeName.IndexOf(',', StringComparison.Ordinal);
+        if (comma > 0)
+            return typeName.Substring(0, comma).Trim();
+
+        return typeName;
+    }
+
+    private void Close() => MudDialog.Close();
+}
+

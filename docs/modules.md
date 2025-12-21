@@ -23,6 +23,19 @@
 
 > 说明：模块启用/停用通常需要重启；宿主启动时只会加载“启用”的模块，因此 UI/任务/API 列表会随启用状态变化。
 
+## 配置入口与“窗口编辑”（推荐）
+
+如果你的模块需要“配置界面”，推荐以 **模块页面**（`IModuleUiProvider.GetPages`）的形式提供，然后在 `ModuleTaskDefinition.CreateRoute` 中指向该页面的路由：
+
+- 模块页面路由固定为：`/ext/{ModuleId}/{PageKey}`
+- 当 `CreateRoute` 指向 `/ext/...` 时：
+  - “新建任务”弹窗会提供“打开窗口/前往页面”两种方式
+  - “任务中心”会在顶部的“持续任务（可配置）”区域展示该任务，并提供“编辑”按钮直接打开配置窗口
+
+这样可以获得类似“配置窗口”的体验，同时仍复用模块页面渲染能力（`DynamicComponent`）。
+
+> 提醒：保存配置应尽量做到“立即生效”；只有模块启用/停用（影响 DI/后台服务装载）才需要重启。
+
 ## 模块目录结构
 
 模块默认使用持久化目录（Docker 内默认：`/data/modules`；可用配置 `Modules:RootPath` 覆盖）：
@@ -202,6 +215,35 @@ public void ConfigureServices(IServiceCollection services, ModuleHostContext con
     services.AddSingleton<IModuleTaskHandler, MyTaskHandler>();
 }
 ```
+
+## 持续任务（常驻后台能力）模式（推荐）
+
+有些能力并不是“一次性批量任务”，而是需要模块启用后长期运行的后台监听/通知等。这类能力建议：
+
+1) 在模块内注册 `HostedService` 常驻后台运行（`ConfigureServices` 中 `services.AddHostedService<...>()`）。
+2) **不要**把它塞进批量任务队列（`IModuleTaskHandler`），避免队列阻塞或误触发。
+3) 仍然可以在“新建任务/任务中心”里提供一个“配置入口”，做法是注册 `IModuleTaskProvider` 并设置 `CreateRoute` 指向模块配置页：
+
+```csharp
+public IEnumerable<ModuleTaskDefinition> GetTasks(ModuleHostContext context)
+{
+    yield return new ModuleTaskDefinition
+    {
+        Category = "bot",
+        TaskType = "bot_monitor_notify",
+        DisplayName = "监控频道更新通知",
+        Description = "常驻后台监听，不占用批量任务队列；在配置里启用即可生效。",
+        Icon = MudBlazor.Icons.Material.Filled.NotificationsActive,
+        CreateRoute = "/ext/pro.bot-monitor-notify/settings",
+        Order = 100
+    };
+}
+```
+
+这种模式的体验是：
+
+- “新建任务”里点击后打开配置窗口（或跳转配置页）
+- “任务中心”顶部可直接编辑该持续任务配置（方便增删频道/目标等）
 
 ### 示例：批量订阅/加群/退群（用户任务）
 
