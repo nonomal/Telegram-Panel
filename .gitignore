@@ -67,3 +67,4 @@ docker-data/
 # Local build artifacts
 artifacts/
 模块源码/
+src/TelegramPanel.Web/data-protection-keys/

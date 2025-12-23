@@ -260,11 +260,11 @@
         loading = true;
         try
         {
-            var count = await BotTelegram.SyncBotChannelsAsync(selectedBotId, CancellationToken.None);
-            if (count > 0)
-                Snackbar.Add($"同步完成：已清理 {count} 个失效频道", Severity.Success);
+            var result = await BotTelegram.SyncBotChannelsAsync(selectedBotId, CancellationToken.None);
+            if (result.AppliedUpdates > 0 || result.RemovedStale > 0)
+                Snackbar.Add($"同步完成：应用更新 {result.AppliedUpdates} 条，清理失效 {result.RemovedStale} 个频道", Severity.Success);
             else
-                Snackbar.Add("未发现需要清理的频道。提示：新增频道依赖 Bot 自动同步（getUpdates/my_chat_member）", Severity.Info);
+                Snackbar.Add("同步完成：没有需要处理的更新或失效频道。提示：请先把 Bot 设为频道管理员，再点同步。", Severity.Info);
             await LoadBotData();
         }
         catch (Exception ex)

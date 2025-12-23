@@ -17,26 +17,31 @@ public class BotTelegramService
 {
     private readonly BotManagementService _botManagement;
     private readonly TelegramBotApiClient _api;
+    private readonly BotUpdateHub _updateHub;
     private readonly ILogger<BotTelegramService> _logger;
 
     public BotTelegramService(
         BotManagementService botManagement,
         TelegramBotApiClient api,
+        BotUpdateHub updateHub,
         ILogger<BotTelegramService> logger)
     {
         _botManagement = botManagement;
         _api = api;
+        _updateHub = updateHub;
         _logger = logger;
     }
 
+    public sealed record BotChannelSyncResult(int AppliedUpdates, int RemovedStale);
+
     /// <summary>
-    /// 手动同步（对账）：Bot API 无法直接“枚举 Bot 作为管理员的频道”，
-    /// 新增/移除主要依赖 <see cref="BotUpdateHub"/> 轮询到的 my_chat_member updates。
+    /// 手动同步（新增 + 清理）：
+    /// - 新增/移除：尽力从 <see cref="BotUpdateHub"/> 拉取并应用 my_chat_member updates（回放/增量）
+    /// - 清理：对本地已记录频道做一次权限核验，移除 Bot 已被撤权/踢出的频道记录
     ///
-    /// 此处仅用于：对本地已记录的频道做一次权限核验，
-    /// 自动清理 Bot 已被移除/降权导致的“僵尸频道”记录（用于修复漏收 updates 的场景）。
+    /// 说明：Telegram Bot API 无法直接“枚举 Bot 当前所在的所有频道”，因此仍以更新队列为新增来源。
     /// </summary>
-    public async Task<int> SyncBotChannelsAsync(int botId, CancellationToken cancellationToken)
+    public async Task<BotChannelSyncResult> SyncBotChannelsAsync(int botId, CancellationToken cancellationToken)
     {
         if (botId <= 0)
             throw new ArgumentException("botId 无效", nameof(botId));
@@ -47,12 +52,14 @@ public class BotTelegramService
         if (!bot.IsActive)
             throw new InvalidOperationException("该机器人已停用");
 
+        var applied = await DrainAndApplyMyChatMemberUpdatesAsync(botId, cancellationToken);
+
         var channels = (await _botManagement.GetChannelsAsync(botId)).ToList();
         if (channels.Count == 0)
         {
             bot.LastSyncAt = DateTime.UtcNow;
             await _botManagement.UpdateBotAsync(bot);
-            return 0;
+            return new BotChannelSyncResult(AppliedUpdates: applied, RemovedStale: 0);
         }
 
         var botUserId = await GetBotUserIdAsync(bot.Token, cancellationToken);
@@ -96,7 +103,50 @@ public class BotTelegramService
         else
             _logger.LogInformation("Bot manual sync completed: no stale channels removed (botId={BotId})", botId);
 
-        return removed;
+        if (applied > 0)
+            _logger.LogInformation("Bot manual sync applied {Applied} my_chat_member updates (botId={BotId})", applied, botId);
+
+        return new BotChannelSyncResult(AppliedUpdates: applied, RemovedStale: removed);
+    }
+
+    private async Task<int> DrainAndApplyMyChatMemberUpdatesAsync(int botId, CancellationToken cancellationToken)
+    {
+        // 通过 BotUpdateHub 共享单一 getUpdates 轮询，避免 409 Conflict
+        await using var sub = await _updateHub.SubscribeAsync(botId, cancellationToken);
+
+        var applied = 0;
+        var batch = new List<JsonElement>(256);
+
+        // poller 启动时会有短暂延迟 + getUpdates 长轮询，因此这里给足时间（避免“点同步就结束了但更新还没拉到”）。
+        var deadline = DateTime.UtcNow.AddSeconds(8);
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var drainedAny = false;
+            while (sub.Reader.TryRead(out var update))
+            {
+                drainedAny = true;
+
+                if (update.ValueKind == JsonValueKind.Object && update.TryGetProperty("my_chat_member", out _))
+                {
+                    batch.Add(update);
+                    if (batch.Count >= 200)
+                    {
+                        applied += await ApplyMyChatMemberUpdatesAsync(botId, batch, cancellationToken);
+                        batch.Clear();
+                    }
+                }
+            }
+
+            if (!drainedAny)
+                await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
+        }
+
+        if (batch.Count > 0)
+            applied += await ApplyMyChatMemberUpdatesAsync(botId, batch, cancellationToken);
+
+        return applied;
     }
 
     private async Task<string?> GetBotMemberStatusAsync(string token, long chatId, long botUserId, CancellationToken cancellationToken)

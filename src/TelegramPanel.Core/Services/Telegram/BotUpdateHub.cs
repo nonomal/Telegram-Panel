@@ -130,6 +130,10 @@ public sealed class BotUpdateHub : IAsyncDisposable
         private readonly object _subscribersLock = new();
         private readonly Dictionary<Guid, Channel<JsonElement>> _subscribers = new();
 
+        private const int PendingMyChatMemberMax = 2000;
+        private readonly object _pendingLock = new();
+        private readonly Queue<JsonElement> _pendingMyChatMember = new();
+
         private long _nextOffset;
 
         public int BotId => _persistBotId;
@@ -182,9 +186,28 @@ public sealed class BotUpdateHub : IAsyncDisposable
             var id = Guid.NewGuid();
             var ch = Channel.CreateBounded<JsonElement>(SubscriberChannelOptions);
 
+            List<JsonElement>? pending = null;
             lock (_subscribersLock)
             {
                 _subscribers[id] = ch;
+            }
+
+            lock (_pendingLock)
+            {
+                if (_pendingMyChatMember.Count > 0)
+                {
+                    pending = _pendingMyChatMember.ToList();
+                    _pendingMyChatMember.Clear();
+                }
+            }
+
+            if (pending != null)
+            {
+                foreach (var u in pending)
+                {
+                    // 尽力写入：满了就丢，避免首次订阅阻塞
+                    ch.Writer.TryWrite(u);
+                }
             }
 
             return new BotUpdateSubscription(_persistBotId, ch.Reader, async () =>
@@ -277,6 +300,18 @@ public sealed class BotUpdateHub : IAsyncDisposable
 
         private void Broadcast(JsonElement update)
         {
+            // 即使当前没有订阅者，也要缓存 my_chat_member 更新：
+            // 手动同步通常是“点按钮才订阅”，否则 poller 会把更新吃掉导致新增频道永远同步不到。
+            if (update.ValueKind == JsonValueKind.Object && update.TryGetProperty("my_chat_member", out _))
+            {
+                lock (_pendingLock)
+                {
+                    _pendingMyChatMember.Enqueue(update.Clone());
+                    while (_pendingMyChatMember.Count > PendingMyChatMemberMax)
+                        _pendingMyChatMember.Dequeue();
+                }
+            }
+
             List<Channel<JsonElement>> targets;
             lock (_subscribersLock)
             {

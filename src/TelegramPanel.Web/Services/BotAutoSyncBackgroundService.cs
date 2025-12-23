@@ -31,8 +31,8 @@ public class BotAutoSyncBackgroundService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // 默认开启：满足“Bot 拉进频道后自动出现”的直觉
-        var enabled = _configuration.GetValue("Telegram:BotAutoSyncEnabled", true);
+        // 默认关闭：避免对“后台自动同步”的误解；需要时可显式开启
+        var enabled = _configuration.GetValue("Telegram:BotAutoSyncEnabled", false);
         if (!enabled)
         {
             _logger.LogInformation("Bot auto sync disabled (Telegram:BotAutoSyncEnabled=false)");
