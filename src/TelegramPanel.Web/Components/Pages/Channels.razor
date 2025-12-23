@@ -16,32 +16,63 @@
 
 <MudCard>
     <MudCardContent>
-        <MudTable Items="@channels" Hover="true" Breakpoint="Breakpoint.Sm" Loading="@loading" Filter="FilterFunc">
+        <MudTable Items="@channels" Hover="true" Breakpoint="Breakpoint.Sm" Loading="@loading" Filter="FilterFunc"
+                  MultiSelection="true" @bind-SelectedItems="selectedChannels">
             <ToolBarContent>
-                <MudText Typo="Typo.h6">频道 (@channels.Count)</MudText>
-                <MudSpacer />
-                <MudSelect @bind-Value="filterAccount" @bind-Value:after="LoadChannels" Label="筛选账号" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 220px;">
-                    <MudSelectItem Value="0">全部账号</MudSelectItem>
-                    @foreach (var account in accounts)
-                    {
-                        <MudSelectItem Value="@account.Id">@FormatAccountLabel(account)</MudSelectItem>
-                    }
-                </MudSelect>
-                <MudSelect @bind-Value="filterType" Label="频道类型" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 120px;">
-                    <MudSelectItem Value='@("all")'>全部</MudSelectItem>
-                    <MudSelectItem Value='@("public")'>公开</MudSelectItem>
-                    <MudSelectItem Value='@("private")'>私密</MudSelectItem>
-                </MudSelect>
-                <MudButton Variant="Variant.Outlined" Color="Color.Info" StartIcon="@Icons.Material.Filled.Sync" Class="mr-2"
-                           Disabled="@(loading || filterAccount <= 0)" OnClick="SyncCurrentAccountChannels">
-                    同步当前账号数据
-                </MudButton>
-                <MudButton Variant="Variant.Outlined" Color="Color.Info" StartIcon="@Icons.Material.Filled.Sync" Class="mr-2"
-                           Disabled="@loading" OnClick="SyncAllAccountsChannels">
-                    同步全部账号数据
-                </MudButton>
-                <MudTextField @bind-Value="searchString" Placeholder="搜索频道..." Adornment="Adornment.Start"
-                              AdornmentIcon="@Icons.Material.Filled.Search" IconSize="Size.Medium" Class="mt-0" />
+                <MudStack Spacing="1">
+                    <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="2" Style="flex-wrap: wrap;">
+                        <MudText Typo="Typo.h6">频道 (@channels.Count)</MudText>
+                        @if (selectedChannels.Count > 0)
+                        {
+                            <MudChip T="string" Size="Size.Small" Color="Color.Info">已选 @selectedChannels.Count</MudChip>
+                        }
+                        <MudSpacer />
+                        <MudTextField @bind-Value="searchString" Placeholder="搜索频道..." Adornment="Adornment.Start"
+                                      AdornmentIcon="@Icons.Material.Filled.Search" IconSize="Size.Medium" Class="mt-0"
+                                      Immediate="true" />
+                    </MudStack>
+
+                    <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="1" Style="flex-wrap: wrap;">
+                        <MudSelect @bind-Value="filterAccount" @bind-Value:after="LoadChannels" Label="筛选账号" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 220px;">
+                            <MudSelectItem Value="0">全部账号</MudSelectItem>
+                            @foreach (var account in accounts)
+                            {
+                                <MudSelectItem Value="@account.Id">@FormatAccountLabel(account)</MudSelectItem>
+                            }
+                        </MudSelect>
+                        <MudSelect @bind-Value="filterType" Label="频道类型" Variant="Variant.Outlined" Dense="true" Class="mr-2" Style="min-width: 120px;">
+                            <MudSelectItem Value='@("all")'>全部</MudSelectItem>
+                            <MudSelectItem Value='@("public")'>公开</MudSelectItem>
+                            <MudSelectItem Value='@("private")'>私密</MudSelectItem>
+                        </MudSelect>
+                        <MudButton Variant="Variant.Outlined" Color="Color.Info" StartIcon="@Icons.Material.Filled.Sync"
+                                   Disabled="@(loading || filterAccount <= 0)" OnClick="SyncCurrentAccountChannels" Size="Size.Small">
+                            同步当前账号数据
+                        </MudButton>
+                        <MudButton Variant="Variant.Outlined" Color="Color.Info" StartIcon="@Icons.Material.Filled.Sync"
+                                   Disabled="@loading" OnClick="SyncAllAccountsChannels" Size="Size.Small">
+                            同步全部账号数据
+                        </MudButton>
+
+                        <MudButton Variant="Variant.Outlined" Color="Color.Primary" StartIcon="@SelectionToggleIcon"
+                                   Disabled="@(loading || !GetFilteredChannels().Any())" OnClick="CycleSelectionToggle" Size="Size.Small">
+                            @SelectionToggleText
+                        </MudButton>
+
+                        <MudMenu Dense="true" Disabled="@loading">
+                            <ActivatorContent>
+                                <MudButton Variant="Variant.Outlined" Color="Color.Default" StartIcon="@Icons.Material.Filled.MoreHoriz"
+                                           Disabled="@loading" Size="Size.Small">
+                                    批量操作
+                                </MudButton>
+                            </ActivatorContent>
+                            <ChildContent>
+                                <MudMenuItem Disabled="@(selectedChannels.Count == 0)" OnClick="OpenBatchInviteSelected">批量邀请（已选）</MudMenuItem>
+                                <MudMenuItem Disabled="@(selectedChannels.Count == 0)" OnClick="OpenBatchSetAdminsSelected">批量设置管理员（已选）</MudMenuItem>
+                            </ChildContent>
+                        </MudMenu>
+                    </MudStack>
+                </MudStack>
             </ToolBarContent>
             <HeaderContent>
                 <MudTh>频道名称</MudTh>
@@ -100,6 +131,8 @@
                     <MudMenu Icon="@Icons.Material.Filled.MoreVert" Size="Size.Small">
                         <MudMenuItem Icon="@Icons.Material.Filled.Info" OnClick="@(async () => await ShowDetails(context))">查看详情</MudMenuItem>
                         <MudMenuItem Icon="@Icons.Material.Filled.Edit" OnClick="@(async () => await EditChannel(context))">编辑频道</MudMenuItem>
+                        <MudMenuItem Icon="@Icons.Material.Filled.PersonAdd" OnClick="@(async () => await OpenInvite(context))">邀请成员</MudMenuItem>
+                        <MudMenuItem Icon="@Icons.Material.Filled.AdminPanelSettings" OnClick="@(async () => await OpenSetAdmins(context))">设置管理员</MudMenuItem>
                         <MudMenuItem Icon="@Icons.Material.Filled.PersonRemove" OnClick="@(async () => await KickUser(context))">踢人</MudMenuItem>
                         <MudMenuItem Icon="@Icons.Material.Filled.Link" OnClick="@(async () => await CopyLinkAsync(context))">复制链接</MudMenuItem>
                         <MudDivider />
@@ -124,6 +157,24 @@
     private string searchString = "";
     private int filterAccount = 0;
     private string filterType = "all";
+    private HashSet<Channel> selectedChannels = new();
+
+    private SelectionToggleMode _selectionToggleMode = SelectionToggleMode.SelectAll;
+    private string SelectionToggleText => _selectionToggleMode switch
+    {
+        SelectionToggleMode.SelectAll => "全选",
+        SelectionToggleMode.Invert => "反选",
+        SelectionToggleMode.Clear => "清空选择",
+        _ => "全选"
+    };
+
+    private string SelectionToggleIcon => _selectionToggleMode switch
+    {
+        SelectionToggleMode.SelectAll => Icons.Material.Filled.SelectAll,
+        SelectionToggleMode.Invert => Icons.Material.Filled.Flip,
+        SelectionToggleMode.Clear => Icons.Material.Filled.Clear,
+        _ => Icons.Material.Filled.SelectAll
+    };
 
     protected override async Task OnInitializedAsync()
     {
@@ -151,6 +202,7 @@
         {
             var channelList = await ChannelManagement.GetChannelsForViewAsync(filterAccount, includeNonCreator: false);
             channels = channelList.ToList();
+            selectedChannels.Clear();
         }
         catch (Exception ex)
         {
@@ -182,6 +234,65 @@
         return false;
     }
 
+    private IReadOnlyList<Channel> GetFilteredChannels()
+    {
+        return channels.Where(FilterFunc).ToList();
+    }
+
+    private Task SelectAllFiltered()
+    {
+        selectedChannels = GetFilteredChannels().ToHashSet();
+        return Task.CompletedTask;
+    }
+
+    private Task InvertSelection()
+    {
+        var targets = GetFilteredChannels().ToList();
+        foreach (var c in targets)
+        {
+            if (selectedChannels.Contains(c))
+                selectedChannels.Remove(c);
+            else
+                selectedChannels.Add(c);
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task ClearSelection()
+    {
+        selectedChannels.Clear();
+        return Task.CompletedTask;
+    }
+
+    private async Task CycleSelectionToggle()
+    {
+        switch (_selectionToggleMode)
+        {
+            case SelectionToggleMode.SelectAll:
+                await SelectAllFiltered();
+                _selectionToggleMode = SelectionToggleMode.Invert;
+                break;
+            case SelectionToggleMode.Invert:
+                await InvertSelection();
+                _selectionToggleMode = SelectionToggleMode.Clear;
+                break;
+            case SelectionToggleMode.Clear:
+                await ClearSelection();
+                _selectionToggleMode = SelectionToggleMode.SelectAll;
+                break;
+            default:
+                _selectionToggleMode = SelectionToggleMode.SelectAll;
+                break;
+        }
+    }
+
+    private enum SelectionToggleMode
+    {
+        SelectAll = 0,
+        Invert = 1,
+        Clear = 2
+    }
+
     private static string FormatAccountLabel(Account account)
     {
         var nickname = string.IsNullOrWhiteSpace(account.Nickname) ? null : account.Nickname.Trim();
@@ -191,6 +302,82 @@
         if (!string.IsNullOrWhiteSpace(username))
             return $"{namePart} (@{username})";
         return namePart;
+    }
+
+    private async Task OpenBatchInviteSelected()
+    {
+        var targets = selectedChannels.ToList();
+        if (targets.Count == 0)
+        {
+            Snackbar.Add("未选择任何频道", Severity.Info);
+            return;
+        }
+
+        await OpenInvite(targets);
+    }
+
+    private async Task OpenBatchSetAdminsSelected()
+    {
+        var targets = selectedChannels.ToList();
+        if (targets.Count == 0)
+        {
+            Snackbar.Add("未选择任何频道", Severity.Info);
+            return;
+        }
+
+        await OpenSetAdmins(targets);
+    }
+
+    private async Task OpenInvite(Channel channel)
+    {
+        await OpenInvite(new List<Channel> { channel });
+    }
+
+    private async Task OpenInvite(List<Channel> targets)
+    {
+        var defaultAccountId = GuessDefaultExecuteAccountId(targets);
+        var parameters = new DialogParameters
+        {
+            ["Channels"] = targets,
+            ["DefaultAccountId"] = defaultAccountId
+        };
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Large, FullWidth = true };
+        var dialog = DialogService.Show<ChannelBatchInviteDialog>("邀请成员", parameters, options);
+        await dialog.Result;
+    }
+
+    private async Task OpenSetAdmins(Channel channel)
+    {
+        await OpenSetAdmins(new List<Channel> { channel });
+    }
+
+    private async Task OpenSetAdmins(List<Channel> targets)
+    {
+        var defaultAccountId = GuessDefaultExecuteAccountId(targets);
+        var parameters = new DialogParameters
+        {
+            ["Channels"] = targets,
+            ["DefaultAccountId"] = defaultAccountId
+        };
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Large, FullWidth = true };
+        var dialog = DialogService.Show<ChannelBatchAdminsDialog>("设置管理员", parameters, options);
+        await dialog.Result;
+    }
+
+    private int GuessDefaultExecuteAccountId(IReadOnlyList<Channel> targets)
+    {
+        if (targets.Count == 1)
+        {
+            var cid = targets[0].CreatorAccountId;
+            if (cid != null && cid.Value > 0)
+                return cid.Value;
+        }
+
+        if (filterAccount > 0)
+            return filterAccount;
+
+        var ids = targets.Select(x => x.CreatorAccountId).Where(x => x != null && x.Value > 0).Select(x => x!.Value).Distinct().ToList();
+        return ids.Count == 1 ? ids[0] : 0;
     }
 
     private async Task SyncCurrentAccountChannels()
