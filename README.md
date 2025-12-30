@@ -78,6 +78,9 @@ docker compose up -d --build
 
 > 说明：**不需要每个账号都申请**，全站共用这一对 `api_id` / `api_hash` 就能工作。
 
+🏪 推荐 Telegram 开发者 API 购买：  
+https://faka.boxmoe.eu.org/
+
 ### 数据持久化（别乱删）
 
 容器内所有持久化数据统一挂载到宿主机 `./docker-data`：
