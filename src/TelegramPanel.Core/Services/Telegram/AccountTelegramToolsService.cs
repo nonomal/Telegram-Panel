@@ -1043,7 +1043,10 @@ public class AccountTelegramToolsService
 
     private sealed record CreateChannelProbeResult(bool Success, bool IsFrozen, string Message);
 
-    private static (string summary, string details) MapTelegramException(Exception ex)
+    /// <summary>
+    /// 将 Telegram 异常映射为可读的摘要和详情。
+    /// </summary>
+    public static (string summary, string details) MapTelegramException(Exception ex)
     {
         var msg = ex.Message ?? string.Empty;
 
@@ -1068,6 +1071,12 @@ public class AccountTelegramToolsService
 
         if (msg.Contains("AUTH_KEY_UNREGISTERED", StringComparison.OrdinalIgnoreCase))
             return ("Session 失效（AUTH_KEY_UNREGISTERED）", msg);
+
+        if (msg.Contains("AUTH_KEY_DUPLICATED", StringComparison.OrdinalIgnoreCase))
+            return ("Session 冲突（AUTH_KEY_DUPLICATED）", "该 Session 可能在其他设备/应用上同时使用，导致密钥冲突。" + Environment.NewLine + msg);
+
+        if (msg.Contains("SESSION_REVOKED", StringComparison.OrdinalIgnoreCase))
+            return ("Session 已被撤销（SESSION_REVOKED）", "该 Session 已被注销或撤销，需要重新登录。" + Environment.NewLine + msg);
 
         if (msg.Contains("SESSION_PASSWORD_NEEDED", StringComparison.OrdinalIgnoreCase))
             return ("需要两步验证密码（SESSION_PASSWORD_NEEDED）", msg);

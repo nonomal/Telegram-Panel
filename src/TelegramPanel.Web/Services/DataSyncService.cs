@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using TelegramPanel.Core.Interfaces;
 using TelegramPanel.Core.Services;
+using TelegramPanel.Core.Services.Telegram;
 using TelegramPanel.Data.Entities;
 
 namespace TelegramPanel.Web.Services;
@@ -111,6 +112,21 @@ public class DataSyncService
             {
                 _logger.LogWarning(ex, "Account sync failed: {AccountId}", account.Id);
                 summary.AccountFailures.Add((account.Id, account.Phone, ex.Message));
+
+                // 同步失败时更新账号的 Telegram 状态
+                try
+                {
+                    var (statusSummary, statusDetails) = AccountTelegramToolsService.MapTelegramException(ex);
+                    account.TelegramStatusOk = false;
+                    account.TelegramStatusSummary = statusSummary;
+                    account.TelegramStatusDetails = statusDetails;
+                    account.TelegramStatusCheckedAtUtc = DateTime.UtcNow;
+                    await _accountManagement.UpdateAccountAsync(account);
+                }
+                catch (Exception statusEx)
+                {
+                    _logger.LogWarning(statusEx, "Failed to update Telegram status for account {AccountId}", account.Id);
+                }
             }
         }
 
