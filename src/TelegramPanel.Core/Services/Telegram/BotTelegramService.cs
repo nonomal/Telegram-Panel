@@ -571,6 +571,13 @@ public class BotTelegramService
                 if (!canPromote)
                     throw new InvalidOperationException(reason);
 
+                var targetStatus = await GetChatMemberStatusAsync(bot.Token, chatId, userId, cancellationToken);
+                if (string.Equals(targetStatus, "left", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(targetStatus, "kicked", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("目标未加入该频道/群，无法设置管理员（请先把目标加入聊天后再设置管理员）");
+                }
+
                 var args = new Dictionary<string, string?>
                 {
                     ["chat_id"] = chatId.ToString(),
@@ -714,6 +721,13 @@ public class BotTelegramService
                 if (!canPromote)
                     throw new InvalidOperationException(reason);
 
+                var targetStatus = await GetChatMemberStatusAsync(bot.Token, chatId, userId, cancellationToken);
+                if (string.Equals(targetStatus, "left", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(targetStatus, "kicked", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("目标未加入该频道/群，无法设置管理员（请先把目标加入聊天后再设置管理员）");
+                }
+
                 var args = new Dictionary<string, string?>
                 {
                     ["chat_id"] = chatId.ToString(),
@@ -734,6 +748,10 @@ public class BotTelegramService
             catch (Exception ex)
             {
                 var msg = ex.Message;
+                if (IsChatAdminInviteRequiredError(msg))
+                {
+                    msg = "目标未加入该频道/群（或需要管理员邀请加入），无法设置管理员：请先把目标加入聊天后再设置管理员";
+                }
                 failures[chatId] = msg;
                 _logger.LogWarning(ex, "PromoteChatMember failed for bot {BotId} chat {ChatId} user {UserId}", botId, chatId, userId);
             }
@@ -822,34 +840,33 @@ public class BotTelegramService
                 if (!canBan)
                     throw new InvalidOperationException(reason);
 
-                if (permanentBan)
-                {
-                    // 永久封禁：调用 banChatMember（默认永久封禁）
-                    var banArgs = new Dictionary<string, string?>
-                    {
-                        ["chat_id"] = chatId.ToString(),
-                        ["user_id"] = userId.ToString(),
-                        ["revoke_messages"] = "false" // 不撤回用户的历史消息
-                    };
-                    await _api.CallAsync(bot.Token, "banChatMember", banArgs, cancellationToken);
-                }
-                else
-                {
-                    // 仅踢出：先封禁再立即解封
-                    var banArgs = new Dictionary<string, string?>
-                    {
-                        ["chat_id"] = chatId.ToString(),
-                        ["user_id"] = userId.ToString(),
-                        ["revoke_messages"] = "false"
-                    };
-                    await _api.CallAsync(bot.Token, "banChatMember", banArgs, cancellationToken);
+                // 目标如果是管理员：Telegram 不允许直接 ban/kick 管理员，需先取消管理员再踢出
+                var targetStatus = await GetChatMemberStatusAsync(bot.Token, chatId, userId, cancellationToken);
+                if (string.Equals(targetStatus, "creator", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("目标是频道创建者，无法踢出/封禁");
 
-                    var unbanArgs = new Dictionary<string, string?>
-                    {
-                        ["chat_id"] = chatId.ToString(),
-                        ["user_id"] = userId.ToString()
-                    };
-                    await _api.CallAsync(bot.Token, "unbanChatMember", unbanArgs, cancellationToken);
+                if (string.Equals(targetStatus, "administrator", StringComparison.OrdinalIgnoreCase))
+                {
+                    var (canPromote, promoteReason) = await CanBotPromoteMembersAsync(bot.Token, chatId, botUserId, cancellationToken);
+                    if (!canPromote)
+                        throw new InvalidOperationException($"目标是管理员，且无法取消管理员权限：{promoteReason}");
+
+                    await DemoteChatMemberAsync(bot.Token, chatId, userId, cancellationToken);
+                }
+
+                try
+                {
+                    await BanOrKickInternalAsync(bot.Token, chatId, userId, permanentBan, cancellationToken);
+                }
+                catch (InvalidOperationException ex) when (IsUserIsAdministratorError(ex.Message))
+                {
+                    // 兜底：即使前面没识别到/状态变化，也尝试“先降权再踢”
+                    var (canPromote, promoteReason) = await CanBotPromoteMembersAsync(bot.Token, chatId, botUserId, cancellationToken);
+                    if (!canPromote)
+                        throw new InvalidOperationException($"目标是管理员，且无法取消管理员权限：{promoteReason}");
+
+                    await DemoteChatMemberAsync(bot.Token, chatId, userId, cancellationToken);
+                    await BanOrKickInternalAsync(bot.Token, chatId, userId, permanentBan, cancellationToken);
                 }
 
                 ok++;
@@ -890,5 +907,96 @@ public class BotTelegramService
             return (false, "机器人缺少封禁用户权限（请在频道管理员设置里给机器人开启封禁用户权限）");
 
         return (true, "");
+    }
+
+    private static bool IsUserIsAdministratorError(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        // 典型：Bot API 调用失败：banChatMember (400) Bad Request: user is an administrator of the chat
+        return message.IndexOf("administrator of the chat", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool IsChatAdminInviteRequiredError(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        // 典型：Bot API 调用失败：promoteChatMember (400) Bad Request: CHAT_ADMIN_INVITE_REQUIRED
+        return message.IndexOf("CHAT_ADMIN_INVITE_REQUIRED", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private async Task<string?> GetChatMemberStatusAsync(string token, long chatId, long userId, CancellationToken cancellationToken)
+    {
+        var member = await _api.CallAsync(token, "getChatMember", new Dictionary<string, string?>
+        {
+            ["chat_id"] = chatId.ToString(),
+            ["user_id"] = userId.ToString()
+        }, cancellationToken);
+
+        if (member.ValueKind != JsonValueKind.Object)
+            return null;
+
+        return member.TryGetProperty("status", out var statusEl) ? statusEl.GetString() : null;
+    }
+
+    private async Task DemoteChatMemberAsync(string token, long chatId, long userId, CancellationToken cancellationToken)
+    {
+        // promoteChatMember：把所有管理员权限设为 false，即可取消管理员身份（demote）
+        var args = new Dictionary<string, string?>
+        {
+            ["chat_id"] = chatId.ToString(),
+            ["user_id"] = userId.ToString(),
+            ["is_anonymous"] = "false",
+            ["can_manage_chat"] = "false",
+            ["can_change_info"] = "false",
+            ["can_post_messages"] = "false",
+            ["can_edit_messages"] = "false",
+            ["can_delete_messages"] = "false",
+            ["can_invite_users"] = "false",
+            ["can_restrict_members"] = "false",
+            ["can_pin_messages"] = "false",
+            ["can_promote_members"] = "false",
+            ["can_manage_video_chats"] = "false",
+            ["can_manage_topics"] = "false",
+            ["can_post_stories"] = "false",
+            ["can_edit_stories"] = "false",
+            ["can_delete_stories"] = "false"
+        };
+
+        await _api.CallAsync(token, "promoteChatMember", args, cancellationToken);
+    }
+
+    private async Task BanOrKickInternalAsync(string token, long chatId, long userId, bool permanentBan, CancellationToken cancellationToken)
+    {
+        if (permanentBan)
+        {
+            // 永久封禁：调用 banChatMember（默认永久封禁）
+            var banArgs = new Dictionary<string, string?>
+            {
+                ["chat_id"] = chatId.ToString(),
+                ["user_id"] = userId.ToString(),
+                ["revoke_messages"] = "false" // 不撤回用户的历史消息
+            };
+            await _api.CallAsync(token, "banChatMember", banArgs, cancellationToken);
+            return;
+        }
+
+        // 仅踢出：先封禁再立即解封
+        var kickArgs = new Dictionary<string, string?>
+        {
+            ["chat_id"] = chatId.ToString(),
+            ["user_id"] = userId.ToString(),
+            ["revoke_messages"] = "false"
+        };
+        await _api.CallAsync(token, "banChatMember", kickArgs, cancellationToken);
+
+        var unbanArgs = new Dictionary<string, string?>
+        {
+            ["chat_id"] = chatId.ToString(),
+            ["user_id"] = userId.ToString()
+        };
+        await _api.CallAsync(token, "unbanChatMember", unbanArgs, cancellationToken);
     }
 }
