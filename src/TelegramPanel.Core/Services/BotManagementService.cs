@@ -73,6 +73,55 @@ public class BotManagementService
         await _botRepository.UpdateAsync(bot);
     }
 
+    public async Task UpdateBotProfileAsync(int botId, string name, string? username, string? newToken)
+    {
+        name = (name ?? string.Empty).Trim();
+        username = string.IsNullOrWhiteSpace(username) ? null : username.Trim().TrimStart('@');
+        newToken = string.IsNullOrWhiteSpace(newToken) ? null : newToken.Trim();
+
+        if (botId <= 0)
+            throw new ArgumentException("BotId 无效", nameof(botId));
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("机器人名称不能为空", nameof(name));
+
+        var bot = await _botRepository.GetByIdAsync(botId)
+            ?? throw new InvalidOperationException($"机器人不存在：{botId}");
+
+        if (!string.Equals(bot.Name, name, StringComparison.Ordinal))
+        {
+            var existing = await _botRepository.GetByNameAsync(name);
+            if (existing != null && existing.Id != botId)
+                throw new InvalidOperationException("机器人名称已存在");
+        }
+
+        bot.Name = name;
+        bot.Username = username;
+        if (newToken != null)
+            bot.Token = newToken;
+
+        try
+        {
+            await _botRepository.UpdateAsync(bot);
+        }
+        catch (DbUpdateException ex)
+        {
+            var msg = GetInnermostMessage(ex);
+            if (msg.Contains("UNIQUE constraint failed: Bots.Name", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("机器人名称已存在");
+
+            if (msg.Contains("database is locked", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("database is busy", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("SQLite Error 5", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("数据库正被占用（SQLite database is locked），请稍后重试；若云端部署了多个实例共享同一个 sqlite 文件，请改为单实例或换用 MySQL/PostgreSQL。");
+
+            if (msg.Contains("no such table: Bots", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("no such column", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"数据库结构过旧或未完成迁移，请重启主程序以自动迁移数据库。详情：{msg}");
+
+            throw new InvalidOperationException($"更新机器人失败：{msg}", ex);
+        }
+    }
+
     public async Task SetBotActiveStatusAsync(int botId, bool isActive)
     {
         var bot = await _botRepository.GetByIdAsync(botId);
@@ -123,7 +172,85 @@ public class BotManagementService
             CreatedAt = DateTime.UtcNow
         };
 
-        return await _categoryRepository.AddAsync(cat);
+        try
+        {
+            return await _categoryRepository.AddAsync(cat);
+        }
+        catch (DbUpdateException ex)
+        {
+            var msg = GetInnermostMessage(ex);
+            if (msg.Contains("UNIQUE constraint failed: BotChannelCategories.Name", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("分类名称已存在");
+
+            if (msg.Contains("database is locked", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("database is busy", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("SQLite Error 5", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("数据库正被占用（SQLite database is locked），请稍后重试；若云端部署了多个实例共享同一个 sqlite 文件，请改为单实例或换用 MySQL/PostgreSQL。");
+
+            if (msg.Contains("no such table: BotChannelCategories", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("no such column", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("NOT NULL constraint failed: BotChannelCategories.BotId", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"数据库结构过旧或未完成迁移，请重启主程序以自动迁移数据库。详情：{msg}");
+
+            throw new InvalidOperationException($"创建分类失败：{msg}", ex);
+        }
+    }
+
+    public async Task<BotChannelCategory> UpdateCategoryAsync(int categoryId, string name, string? description = null)
+    {
+        if (categoryId <= 0)
+            throw new ArgumentException("分类ID无效", nameof(categoryId));
+
+        name = (name ?? string.Empty).Trim();
+        description = string.IsNullOrWhiteSpace(description) ? null : description.Trim();
+
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("分类名称不能为空", nameof(name));
+
+        var cat = await _categoryRepository.GetByIdAsync(categoryId);
+        if (cat == null)
+            throw new InvalidOperationException("分类不存在或已被删除");
+
+        if (!string.Equals(cat.Name, name, StringComparison.Ordinal))
+        {
+            var existing = await _categoryRepository.GetByNameAsync(name);
+            if (existing != null && existing.Id != cat.Id)
+                throw new InvalidOperationException("分类名称已存在");
+        }
+
+        cat.Name = name;
+        cat.Description = description;
+
+        try
+        {
+            await _categoryRepository.UpdateAsync(cat);
+            return cat;
+        }
+        catch (DbUpdateException ex)
+        {
+            var msg = GetInnermostMessage(ex);
+            if (msg.Contains("UNIQUE constraint failed: BotChannelCategories.Name", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("分类名称已存在");
+
+            if (msg.Contains("database is locked", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("database is busy", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("SQLite Error 5", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("数据库正被占用（SQLite database is locked），请稍后重试；若云端部署了多个实例共享同一个 sqlite 文件，请改为单实例或换用 MySQL/PostgreSQL。");
+
+            if (msg.Contains("no such table: BotChannelCategories", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("no such column", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"数据库结构过旧或未完成迁移，请重启主程序以自动迁移数据库。详情：{msg}");
+
+            throw new InvalidOperationException($"更新分类失败：{msg}", ex);
+        }
+    }
+
+    private static string GetInnermostMessage(Exception ex)
+    {
+        var cur = ex;
+        while (cur.InnerException != null)
+            cur = cur.InnerException;
+        return string.IsNullOrWhiteSpace(cur.Message) ? ex.Message : cur.Message;
     }
 
     public async Task DeleteCategoryAsync(int categoryId)
@@ -146,6 +273,7 @@ public class BotManagementService
         int botId,
         int? categoryId,
         string? search,
+        int statusFilter,
         int pageIndex,
         int pageSize,
         CancellationToken cancellationToken = default)
@@ -155,6 +283,7 @@ public class BotManagementService
             categoryId: categoryId,
             broadcastOnly: true,
             search: search,
+            statusFilter: statusFilter,
             pageIndex: pageIndex,
             pageSize: pageSize,
             cancellationToken: cancellationToken);
@@ -219,6 +348,75 @@ public class BotManagementService
         var remains = await _memberRepository.CountForChannelAsync(ch.Id);
         if (remains == 0)
             await _botChannelRepository.DeleteAsync(ch);
+    }
+
+    /// <summary>
+    /// 获取指定频道绑定的 Bot 列表（按名称排序）。
+    /// </summary>
+    public async Task<IReadOnlyList<Bot>> GetChannelBoundBotsAsync(long telegramId)
+    {
+        var ch = await _botChannelRepository.GetGlobalByTelegramIdAsync(telegramId);
+        if (ch == null)
+            return Array.Empty<Bot>();
+
+        var members = await _memberRepository.FindAsync(x => x.BotChannelId == ch.Id);
+        var botIdSet = members
+            .Select(x => x.BotId)
+            .Where(x => x > 0)
+            .Distinct()
+            .ToHashSet();
+
+        if (botIdSet.Count == 0)
+            return Array.Empty<Bot>();
+
+        var bots = (await _botRepository.GetAllAsync())
+            .Where(x => botIdSet.Contains(x.Id))
+            .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return bots;
+    }
+
+    /// <summary>
+    /// 删除指定频道上选中 Bot 的绑定关系；若无剩余绑定，会自动清理频道本体。
+    /// 返回实际删除的绑定条数。
+    /// </summary>
+    public async Task<int> DeleteChannelBindingsByBotIdsAsync(long telegramId, IReadOnlyCollection<int> botIds)
+    {
+        var selected = botIds
+            .Where(x => x > 0)
+            .Distinct()
+            .ToList();
+        if (selected.Count == 0)
+            return 0;
+
+        var ch = await _botChannelRepository.GetGlobalByTelegramIdAsync(telegramId);
+        if (ch == null)
+            return 0;
+
+        var removed = await _memberRepository.DeleteByChannelAndBotsAsync(ch.Id, selected);
+        var remains = await _memberRepository.CountForChannelAsync(ch.Id);
+        if (remains == 0)
+            await _botChannelRepository.DeleteAsync(ch);
+
+        return removed;
+    }
+
+    public async Task UpdateChannelStatusAsync(int botId, long telegramId, bool ok, string? error, DateTime checkedAtUtc)
+    {
+        var ch = await _botChannelRepository.GetByTelegramIdAsync(botId, telegramId);
+        if (ch == null)
+            return;
+
+        ch.ChannelStatusOk = ok;
+        ch.ChannelStatusCheckedAtUtc = checkedAtUtc;
+        ch.ChannelStatusError = ok
+            ? null
+            : string.IsNullOrWhiteSpace(error)
+                ? "检测失败"
+                : error.Trim()[..Math.Min(error.Trim().Length, 500)];
+
+        await _botChannelRepository.UpdateAsync(ch);
     }
 
     public async Task SetChannelCategoryAsync(int botChannelId, int? categoryId)

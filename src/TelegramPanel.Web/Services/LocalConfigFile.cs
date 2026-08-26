@@ -1,4 +1,7 @@
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 
@@ -6,11 +9,29 @@ namespace TelegramPanel.Web.Services;
 
 public static class LocalConfigFile
 {
+    public static JsonSerializerOptions CreateIndentedJsonSerializerOptions()
+    {
+        return new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            WriteIndented = true,
+            TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+        };
+    }
+
+    public static string ToIndentedJson(JsonNode? node)
+    {
+        return (node ?? new JsonObject()).ToJsonString(CreateIndentedJsonSerializerOptions());
+    }
+
     public static string ResolvePath(IConfiguration configuration, IWebHostEnvironment environment)
     {
         var configured = (configuration["LocalConfig:Path"] ?? "").Trim();
         if (!string.IsNullOrWhiteSpace(configured))
-            return configured;
+            return StoragePathResolver.ResolveRelativeToBase(configured, environment.ContentRootPath);
+
+        var persistentRoot = StoragePathResolver.ResolvePersistentRoot(configuration);
+        if (!string.IsNullOrWhiteSpace(persistentRoot))
+            return Path.Combine(persistentRoot, "appsettings.local.json");
 
         // Docker 部署默认持久化目录为 /data（docker-compose 挂载 ./docker-data:/data）
         // 即便没有显式配置，也优先写到 /data，避免写入镜像层 /app 导致丢失或权限问题。

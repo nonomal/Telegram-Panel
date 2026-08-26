@@ -1,7 +1,9 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using TelegramPanel.Core.BatchTasks;
 using TelegramPanel.Core.Services;
 using TelegramPanel.Data.Entities;
 using TelegramPanel.Modules;
@@ -16,15 +18,25 @@ public sealed class BatchTaskBackgroundService : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<BatchTaskBackgroundService> _logger;
     private readonly IConfiguration _configuration;
+    private readonly BatchTaskExecutionControlService _executionControl;
+    private readonly BatchTaskStartupRecoveryService? _startupRecovery;
+    private readonly TelegramPanel.Web.Modules.ModuleContributionRegistry? _contributions;
+    private readonly ConcurrentDictionary<int, Task> _runningTasks = new();
 
     public BatchTaskBackgroundService(
         IServiceScopeFactory scopeFactory,
         IConfiguration configuration,
-        ILogger<BatchTaskBackgroundService> logger)
+        BatchTaskExecutionControlService executionControl,
+        ILogger<BatchTaskBackgroundService> logger,
+        BatchTaskStartupRecoveryService? startupRecovery = null,
+        TelegramPanel.Web.Modules.ModuleContributionRegistry? contributions = null)
     {
         _scopeFactory = scopeFactory;
         _configuration = configuration;
+        _executionControl = executionControl;
         _logger = logger;
+        _startupRecovery = startupRecovery;
+        _contributions = contributions;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -41,16 +53,35 @@ public sealed class BatchTaskBackgroundService : BackgroundService
         if (seconds > 30) seconds = 30;
         var interval = TimeSpan.FromSeconds(seconds);
 
-        _logger.LogInformation("Batch task runner started, interval {IntervalSeconds} seconds", seconds);
+        var initialMaxConcurrent = ReadMaxConcurrent();
+
+        _logger.LogInformation(
+            "Batch task runner started, interval {IntervalSeconds} seconds, maxConcurrent {MaxConcurrent}",
+            seconds,
+            initialMaxConcurrent);
 
         // 延迟一点，避免与启动时 DB 迁移抢资源
         await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
+
+        if (_startupRecovery != null)
+            await _startupRecovery.EnsureRecoveredAsync(stoppingToken);
+        else
+            await RecoverInterruptedTasksAsync(stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await TryRunOneAsync(stoppingToken);
+                // 先清理已结束的任务，避免“占位”导致无法继续启动新任务
+                CleanupCompletedTasks();
+                var maxConcurrent = ReadMaxConcurrent();
+
+                while (_runningTasks.Count < maxConcurrent)
+                {
+                    var started = await TryStartOneAsync(stoppingToken);
+                    if (!started)
+                        break;
+                }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -65,72 +96,236 @@ public sealed class BatchTaskBackgroundService : BackgroundService
         }
     }
 
-    private async Task TryRunOneAsync(CancellationToken cancellationToken)
+    private int ReadMaxConcurrent()
+    {
+        var maxConcurrent = _configuration.GetValue("BatchTasks:MaxConcurrent", 1);
+        if (maxConcurrent < 1) return 1;
+        if (maxConcurrent > 10) return 10;
+        return maxConcurrent;
+    }
+
+    private async Task RecoverInterruptedTasksAsync(CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
         var taskManagement = scope.ServiceProvider.GetRequiredService<BatchTaskManagementService>();
+        var requeued = await taskManagement.RequeueRunningTasksAsync(cancellationToken: cancellationToken);
+        if (requeued > 0)
+        {
+            _logger.LogInformation("Recovered {Count} interrupted running batch tasks and set them back to pending", requeued);
+        }
+    }
+
+    private void CleanupCompletedTasks()
+    {
+        foreach (var kv in _runningTasks)
+        {
+            var task = kv.Value;
+            if (!task.IsCompleted && !task.IsCanceled && !task.IsFaulted)
+                continue;
+
+            _runningTasks.TryRemove(kv.Key, out _);
+        }
+    }
+
+    private async Task<bool> TryStartOneAsync(CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var taskManagement = scope.ServiceProvider.GetRequiredService<BatchTaskManagementService>();
+        var supportedTaskTypes = scope.ServiceProvider
+            .GetServices<IModuleTaskHandler>()
+            .Where(handler => !string.IsNullOrWhiteSpace(handler.TaskType))
+            .GroupBy(handler => handler.TaskType.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() == 1)
+            .Select(group => group.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         var pending = (await taskManagement.GetTasksByStatusAsync("pending"))
+            .Where(t => string.Equals(t.ExecutionKind, ModuleTaskExecutionKinds.Batch, StringComparison.OrdinalIgnoreCase))
+            .Where(IsOwnedBatchTask)
+            .Where(t => supportedTaskTypes.Contains(t.TaskType))
+            .Where(t => !_runningTasks.ContainsKey(t.Id))
             .OrderBy(t => t.CreatedAt)
             .FirstOrDefault();
 
         if (pending == null)
-            return;
+            return false;
 
-        await taskManagement.StartTaskAsync(pending.Id);
+        var execution = await _executionControl.TryStartExecutionAsync(pending.Id, cancellationToken);
+        if (execution == null)
+            return false;
+
         _logger.LogInformation("Batch task started: {TaskId} {TaskType}", pending.Id, pending.TaskType);
 
-        var completed = pending.Completed;
-        var failed = pending.Failed;
-
+        // 独立 scope 执行：避免阻塞轮询 loop，实现并发跑多个任务
         try
         {
-            // 模块扩展任务：从 DI 中查找对应 TaskType 的执行器
-            var handler = scope.ServiceProvider
-                .GetServices<IModuleTaskHandler>()
-                .FirstOrDefault(h => string.Equals(h.TaskType, pending.TaskType, StringComparison.OrdinalIgnoreCase));
+            var running = RunTaskAsync(pending.Id, execution, cancellationToken);
+            _runningTasks[pending.Id] = running;
+        }
+        catch
+        {
+            _executionControl.CompleteExecution(execution);
+            throw;
+        }
 
-            if (handler == null)
-            {
-                failed = pending.Total == 0 ? 1 : pending.Total;
-                await taskManagement.UpdateTaskProgressAsync(pending.Id, completed, failed);
-                await taskManagement.CompleteTaskAsync(pending.Id, success: false);
-                _logger.LogWarning("Unsupported batch task type: {TaskType} (task {TaskId})", pending.TaskType, pending.Id);
+        return true;
+    }
+
+    private async Task RunTaskAsync(
+        int taskId,
+        BatchTaskExecutionLease execution,
+        CancellationToken stoppingToken)
+    {
+        var executionToken = execution.CancellationToken;
+        using var executionContext = _executionControl.EnterExecutionContext(execution);
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var taskManagement = scope.ServiceProvider.GetRequiredService<BatchTaskManagementService>();
+
+            var pending = await taskManagement.GetTaskAsync(taskId);
+            if (pending == null || pending.Status != "running")
                 return;
-            }
 
-            var host = new DbBackedModuleTaskExecutionHost(pending, taskManagement, scope.ServiceProvider);
-            await handler.ExecuteAsync(host, cancellationToken);
+            executionToken.ThrowIfCancellationRequested();
+            var completed = pending.Completed;
+            var failed = pending.Failed;
 
-            var after = await taskManagement.GetTaskAsync(pending.Id);
-            if (after != null)
+            try
             {
-                completed = after.Completed;
-                failed = after.Failed;
+                var handlers = scope.ServiceProvider
+                    .GetServices<IModuleTaskHandler>()
+                    .Where(h => string.Equals(h.TaskType, pending.TaskType, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (handlers.Count != 1)
+                {
+                    failed = pending.Total == 0 ? 1 : pending.Total;
+                    await taskManagement.UpdateTaskProgressAsync(pending.Id, completed, failed);
+                    await taskManagement.CompleteTaskAsync(pending.Id, success: false);
+                    _logger.LogWarning(
+                        "Batch task requires exactly one handler: {TaskType} (task {TaskId}, count={Count})",
+                        pending.TaskType,
+                        pending.Id,
+                        handlers.Count);
+                    return;
+                }
+
+                var host = new DbBackedModuleTaskExecutionHost(pending, taskManagement, scope.ServiceProvider);
+                await handlers[0].ExecuteAsync(host, executionToken);
+                executionToken.ThrowIfCancellationRequested();
+
+                var after = await taskManagement.GetTaskAsync(pending.Id);
+                if (after != null)
+                {
+                    completed = after.Completed;
+                    failed = after.Failed;
+                }
+
+                var latest = await taskManagement.GetTaskAsync(pending.Id);
+                if (latest != null && latest.Status != "running")
+                    return;
+
+                if (latest != null && IsPersistentTask(latest))
+                {
+                    var requeued = await taskManagement.RequeueRunningTasksAsync(
+                        t => t.Id == pending.Id,
+                        executionToken);
+                    _logger.LogWarning(
+                        "Persistent batch task returned without explicit completion; requeued instead of completing: {TaskId} {TaskType} (requeued={Requeued})",
+                        pending.Id,
+                        pending.TaskType,
+                        requeued);
+                    return;
+                }
+
+                await taskManagement.CompleteTaskAsync(pending.Id, success: true);
+                _logger.LogInformation("Batch task completed: {TaskId} {TaskType} (completed={Completed}, failed={Failed})",
+                    pending.Id, pending.TaskType, completed, failed);
             }
-
-            // 如果任务被用户取消（当前实现：Cancel 会把状态写成 failed），则不覆盖它
-            var latest = await taskManagement.GetTaskAsync(pending.Id);
-            if (latest != null && latest.Status != "running")
-                return;
-
-            await taskManagement.CompleteTaskAsync(pending.Id, success: failed == 0);
-            _logger.LogInformation("Batch task completed: {TaskId} {TaskType} (ok={Ok}, completed={Completed}, failed={Failed})",
-                pending.Id, pending.TaskType, failed == 0, completed, failed);
+            catch (OperationCanceledException) when (executionToken.IsCancellationRequested)
+            {
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation("Batch task interrupted by shutdown: {TaskId} {TaskType}", pending.Id, pending.TaskType);
+                }
+                else
+                {
+                    _logger.LogInformation("Batch task execution stopped after pause: {TaskId} {TaskType}", pending.Id, pending.TaskType);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Batch task failed: {TaskId} {TaskType}", pending.Id, pending.TaskType);
+                try
+                {
+                    await taskManagement.UpdateTaskProgressAsync(pending.Id, completed, failed == 0 ? 1 : failed);
+                    await taskManagement.CompleteTaskAsync(pending.Id, success: false);
+                }
+                catch
+                {
+                    // 忽略二次收尾错误。
+                }
+            }
+        }
+        catch (OperationCanceledException) when (executionToken.IsCancellationRequested)
+        {
+            // 宿主停机或暂停时由上层状态屏障负责收尾。
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Batch task failed: {TaskId} {TaskType}", pending.Id, pending.TaskType);
+            _logger.LogWarning(ex, "Batch task execution crashed (taskId={TaskId})", taskId);
+        }
+        finally
+        {
+            _runningTasks.TryRemove(taskId, out _);
+            await _executionControl.CompleteExecutionAsync(execution);
+            var keepCount = _configuration.GetValue("BatchTasks:HistoryRetentionLimit", 0);
+            if (keepCount > 0 && !stoppingToken.IsCancellationRequested)
+                await _executionControl.TrimHistoryTasksAsync(keepCount);
+        }
+    }
+
+    private bool IsOwnedBatchTask(BatchTask task)
+    {
+        if (string.Equals(task.OwnerModuleId, "host.legacy", StringComparison.Ordinal))
+            return true;
+        if (_contributions == null
+            || !_contributions.TaskTypeToDefinition.TryGetValue(task.TaskType, out var registered))
+            return false;
+
+        return string.Equals(registered.Module.Id, task.OwnerModuleId, StringComparison.Ordinal)
+            && string.Equals(
+                registered.Definition.ExecutionKind,
+                ModuleTaskExecutionKinds.Batch,
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPersistentTask(BatchTask task)
+    {
+        if (!string.Equals(task.TaskType, BatchTaskTypes.UserChatActive, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var config = (task.Config ?? string.Empty).Trim();
+        if (config.Length > 0)
+        {
             try
             {
-                await taskManagement.UpdateTaskProgressAsync(pending.Id, completed, failed == 0 ? 1 : failed);
-                await taskManagement.CompleteTaskAsync(pending.Id, success: false);
+                using var document = JsonDocument.Parse(config);
+                if (document.RootElement.TryGetProperty("max_messages", out var maxMessages)
+                    && maxMessages.ValueKind == JsonValueKind.Number
+                    && maxMessages.TryGetInt32(out var value))
+                {
+                    return value <= 0;
+                }
             }
-            catch
+            catch (JsonException)
             {
-                // ignore secondary failures
+                // Config 无法解析时回退到 Total，避免异常遮蔽任务本身的收尾逻辑。
             }
         }
+
+        return task.Total <= 0;
     }
 
     private sealed class DbBackedModuleTaskExecutionHost : IModuleTaskExecutionHost

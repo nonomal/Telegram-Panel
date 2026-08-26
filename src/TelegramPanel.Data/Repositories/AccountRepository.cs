@@ -17,6 +17,7 @@ public class AccountRepository : Repository<Account>, IAccountRepository
         var query = _dbSet
             .AsNoTracking()
             .Include(a => a.Category)
+            .Include(a => a.Proxy)
             .AsQueryable();
 
         if (categoryId.HasValue && categoryId.Value > 0)
@@ -31,21 +32,16 @@ public class AccountRepository : Repository<Account>, IAccountRepository
             // 允许用户直接粘贴 “+86 138 0013 8000” 等格式，统一提取纯数字后匹配 Phone 字段
             var phoneDigits = NormalizeDigits(search);
             var phoneLike = phoneDigits.Length > 0 ? $"%{phoneDigits}%" : like;
-            if (long.TryParse(search, out var uid) && uid > 0)
-            {
-                query = query.Where(a =>
-                    a.UserId == uid
-                    || EF.Functions.Like(a.Phone, phoneLike)
-                    || (a.Nickname != null && EF.Functions.Like(a.Nickname, like))
-                    || (a.Username != null && EF.Functions.Like(a.Username, like)));
-            }
-            else
-            {
-                query = query.Where(a =>
-                    EF.Functions.Like(a.Phone, phoneLike)
-                    || (a.Nickname != null && EF.Functions.Like(a.Nickname, like))
-                    || (a.Username != null && EF.Functions.Like(a.Username, like)));
-            }
+            var normalizedNumberSearch = search.TrimStart('#');
+            var hasDisplayNumber = int.TryParse(normalizedNumberSearch, out var displayNumber) && displayNumber > 0;
+            var hasTelegramUserId = long.TryParse(search, out var uid) && uid > 0;
+            query = query.Where(a =>
+                (hasDisplayNumber && a.DisplayNumber == displayNumber)
+                || (hasTelegramUserId && a.UserId == uid)
+                || EF.Functions.Like(a.Phone, phoneLike)
+                || (a.Nickname != null && EF.Functions.Like(a.Nickname, like))
+                || (a.Username != null && EF.Functions.Like(a.Username, like))
+                || (a.Remark != null && EF.Functions.Like(a.Remark, like)));
         }
 
         if (onlyWaste)
@@ -64,6 +60,10 @@ public class AccountRepository : Repository<Account>, IAccountRepository
                     // Session 失效/损坏
                     || EF.Functions.Like(a.TelegramStatusSummary, "%Session 失效%")
                     || EF.Functions.Like(a.TelegramStatusSummary, "%AUTH_KEY_UNREGISTERED%")
+                    || EF.Functions.Like(a.TelegramStatusSummary, "%Session 冲突%")
+                    || EF.Functions.Like(a.TelegramStatusSummary, "%AUTH_KEY_DUPLICATED%")
+                    || EF.Functions.Like(a.TelegramStatusSummary, "%Session 已被撤销%")
+                    || EF.Functions.Like(a.TelegramStatusSummary, "%SESSION_REVOKED%")
                     || EF.Functions.Like(a.TelegramStatusSummary, "%Session 无法读取%")
                     || EF.Functions.Like(a.TelegramStatusSummary, "%Can't read session block%")
 
@@ -79,10 +79,6 @@ public class AccountRepository : Repository<Account>, IAccountRepository
                     || EF.Functions.Like(a.TelegramStatusSummary, "%账号已注销%")
                     || EF.Functions.Like(a.TelegramStatusSummary, "%已注销/被删除%")
                     || EF.Functions.Like(a.TelegramStatusSummary, "%被删除%")
-
-                    // 连接/探测失败（按“废号”处理）
-                    || EF.Functions.Like(a.TelegramStatusSummary, "%连接失败%")
-                    || EF.Functions.Like(a.TelegramStatusSummary, "%创建频道探测失败%")
                 ));
         }
 
@@ -109,6 +105,7 @@ public class AccountRepository : Repository<Account>, IAccountRepository
     {
         return await _dbSet
             .Include(a => a.Category)
+            .Include(a => a.Proxy)
             .Include(a => a.Channels)
             .Include(a => a.Groups)
             .FirstOrDefaultAsync(a => a.Id == id);
@@ -118,6 +115,7 @@ public class AccountRepository : Repository<Account>, IAccountRepository
     {
         return await _dbSet
             .Include(a => a.Category)
+            .Include(a => a.Proxy)
             .ToListAsync();
     }
 
@@ -125,6 +123,7 @@ public class AccountRepository : Repository<Account>, IAccountRepository
     {
         return await _dbSet
             .Include(a => a.Category)
+            .Include(a => a.Proxy)
             .FirstOrDefaultAsync(a => a.Phone == phone);
     }
 
@@ -132,6 +131,7 @@ public class AccountRepository : Repository<Account>, IAccountRepository
     {
         return await _dbSet
             .Include(a => a.Category)
+            .Include(a => a.Proxy)
             .FirstOrDefaultAsync(a => a.UserId == userId);
     }
 
@@ -139,6 +139,7 @@ public class AccountRepository : Repository<Account>, IAccountRepository
     {
         return await _dbSet
             .Include(a => a.Category)
+            .Include(a => a.Proxy)
             .Where(a => a.CategoryId == categoryId)
             .ToListAsync();
     }
@@ -147,8 +148,158 @@ public class AccountRepository : Repository<Account>, IAccountRepository
     {
         return await _dbSet
             .Include(a => a.Category)
-            .Where(a => a.IsActive)
+            .Include(a => a.Proxy)
+            .Where(a => a.IsActive && (a.Category == null || !a.Category.ExcludeFromOperations))
             .ToListAsync();
+    }
+
+    public async Task<int> CountActiveOperationAccountsAsync(CancellationToken cancellationToken = default)
+    {
+        return await _dbSet
+            .AsNoTracking()
+            .CountAsync(a => a.IsActive && (a.Category == null || !a.Category.ExcludeFromOperations), cancellationToken);
+    }
+
+    public async Task<(int Total, int Normal, int Limited, int Invalid)> CountDashboardAsync(CancellationToken cancellationToken = default)
+    {
+        var counts = await _dbSet
+            .AsNoTracking()
+            .GroupBy(_ => 1)
+            .Select(g => new
+            {
+                Total = g.Count(),
+                Normal = g.Count(a =>
+                    a.IsActive
+                    && (a.Category == null || !a.Category.ExcludeFromOperations)
+                    && (
+                        a.TelegramStatusOk == true
+                        || a.TelegramStatusSummary == null
+                        || a.TelegramStatusSummary == ""
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%正常%")
+                    )
+                    && (
+                        a.TelegramStatusSummary == null
+                        || a.TelegramStatusSummary == ""
+                        || !(
+                            EF.Functions.Like(a.TelegramStatusSummary!, "%受限%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%冻结%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%Restricted%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%FROZEN_METHOD_INVALID%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%PEER_FLOOD%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%FLOOD_WAIT%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%创建频道接口被冻结%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%封禁%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%注销%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%停用%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%USER_DEACTIVATED%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%PHONE_NUMBER_BANNED%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 失效%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%AUTH_KEY_UNREGISTERED%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 冲突%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%AUTH_KEY_DUPLICATED%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 已被撤销%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%SESSION_REVOKED%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 无法读取%")
+                            || EF.Functions.Like(a.TelegramStatusSummary!, "%Can't read session block%")
+                        )
+                    )),
+                Limited = g.Count(a =>
+                    a.TelegramStatusSummary != null
+                    && a.TelegramStatusSummary != ""
+                    && (
+                        EF.Functions.Like(a.TelegramStatusSummary!, "%受限%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%冻结%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%Restricted%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%FROZEN_METHOD_INVALID%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%PEER_FLOOD%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%FLOOD_WAIT%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%创建频道接口被冻结%")
+                    )),
+                Invalid = g.Count(a =>
+                    a.TelegramStatusSummary != null
+                    && a.TelegramStatusSummary != ""
+                    && (
+                        EF.Functions.Like(a.TelegramStatusSummary!, "%封禁%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%注销%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%停用%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%USER_DEACTIVATED%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%PHONE_NUMBER_BANNED%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 失效%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%AUTH_KEY_UNREGISTERED%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 冲突%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%AUTH_KEY_DUPLICATED%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 已被撤销%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%SESSION_REVOKED%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 无法读取%")
+                        || EF.Functions.Like(a.TelegramStatusSummary!, "%Can't read session block%")
+                    ))
+            })
+            .FirstOrDefaultAsync(cancellationToken);
+
+        return counts == null
+            ? (0, 0, 0, 0)
+            : (counts.Total, counts.Normal, counts.Limited, counts.Invalid);
+    }
+
+    public async Task<(int Limited, int Banned)> CountTelegramStatusBucketsAsync(CancellationToken cancellationToken = default)
+    {
+        var summaries = _dbSet
+            .AsNoTracking()
+            .Where(a => a.TelegramStatusSummary != null && a.TelegramStatusSummary != "");
+
+        var limited = await summaries.CountAsync(a =>
+            EF.Functions.Like(a.TelegramStatusSummary!, "%受限%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%冻结%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%Restricted%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%FROZEN_METHOD_INVALID%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%PEER_FLOOD%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%FLOOD_WAIT%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%创建频道接口被冻结%"), cancellationToken);
+
+        var banned = await summaries.CountAsync(a =>
+            EF.Functions.Like(a.TelegramStatusSummary!, "%封禁%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%注销%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%停用%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%USER_DEACTIVATED%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%PHONE_NUMBER_BANNED%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 失效%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%AUTH_KEY_UNREGISTERED%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 冲突%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%AUTH_KEY_DUPLICATED%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 已被撤销%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%SESSION_REVOKED%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%Session 无法读取%")
+            || EF.Functions.Like(a.TelegramStatusSummary!, "%Can't read session block%"), cancellationToken);
+
+        return (limited, banned);
+    }
+
+    public async Task<IReadOnlyList<Account>> GetTransientFailedStatusAccountsAsync(
+        int count,
+        TimeSpan minAge,
+        CancellationToken cancellationToken = default)
+    {
+        count = Math.Clamp(count, 1, 100);
+        var cutoffUtc = DateTime.UtcNow - minAge;
+
+        return await _dbSet
+            .AsNoTracking()
+            .Include(a => a.Category)
+            .Include(a => a.Proxy)
+            .Where(a => a.IsActive
+                        && a.TelegramStatusOk == false
+                        && a.TelegramStatusSummary != null
+                        && (a.TelegramStatusCheckedAtUtc == null || a.TelegramStatusCheckedAtUtc <= cutoffUtc))
+            .Where(a =>
+                EF.Functions.Like(a.TelegramStatusSummary!, "%连接失败%")
+                || EF.Functions.Like(a.TelegramStatusSummary!, "%请求超时%")
+                || EF.Functions.Like(a.TelegramStatusSummary!, "%刷新失败%")
+                || EF.Functions.Like(a.TelegramStatusSummary!, "%创建频道探测失败%")
+                || EF.Functions.Like(a.TelegramStatusSummary!, "%无法获取账号资料%"))
+            .OrderBy(a => a.TelegramStatusCheckedAtUtc ?? DateTime.MinValue)
+            .ThenBy(a => a.Id)
+            .Take(count)
+            .ToListAsync(cancellationToken);
     }
 
     public async Task<(IReadOnlyList<Account> Items, int TotalCount)> QueryPagedAsync(
@@ -170,6 +321,8 @@ public class AccountRepository : Repository<Account>, IAccountRepository
             .Take(pageSize)
             .ToListAsync(cancellationToken);
 
+        await PopulateStatisticsAsync(items, cancellationToken);
+
         return (items, total);
     }
 
@@ -182,4 +335,68 @@ public class AccountRepository : Repository<Account>, IAccountRepository
         var query = BuildQuery(categoryId, search, onlyWaste);
         return await query.ToListAsync(cancellationToken);
     }
+
+    private async Task PopulateStatisticsAsync(IReadOnlyList<Account> items, CancellationToken cancellationToken)
+    {
+        if (items.Count == 0)
+            return;
+
+        var accountIds = items
+            .Select(x => x.Id)
+            .Where(x => x > 0)
+            .Distinct()
+            .ToArray();
+
+        if (accountIds.Length == 0)
+            return;
+
+        var linkedChannelPairs = await _context.Set<AccountChannel>()
+            .AsNoTracking()
+            .Join(
+                _context.Set<Channel>().AsNoTracking().Where(x => x.IsBroadcast),
+                link => link.ChannelId,
+                channel => channel.Id,
+                (link, channel) => new { link.AccountId, link.ChannelId })
+            .Where(x => accountIds.Contains(x.AccountId))
+            .ToListAsync(cancellationToken);
+
+        var createdChannelPairs = await _context.Set<Channel>()
+            .AsNoTracking()
+            .Where(x => x.IsBroadcast && x.CreatorAccountId.HasValue && accountIds.Contains(x.CreatorAccountId.Value))
+            .Select(x => new { AccountId = x.CreatorAccountId!.Value, ChannelId = x.Id })
+            .ToListAsync(cancellationToken);
+
+        var channelCountMap = linkedChannelPairs
+            .Concat(createdChannelPairs)
+            .GroupBy(x => x.AccountId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.ChannelId).Distinct().Count());
+
+        var linkedGroupPairs = await _context.Set<AccountGroup>()
+            .AsNoTracking()
+            .Where(x => accountIds.Contains(x.AccountId))
+            .Select(x => new { x.AccountId, x.GroupId })
+            .ToListAsync(cancellationToken);
+
+        var createdGroupPairs = await _context.Set<Group>()
+            .AsNoTracking()
+            .Where(x => x.CreatorAccountId.HasValue && accountIds.Contains(x.CreatorAccountId.Value))
+            .Select(x => new { AccountId = x.CreatorAccountId!.Value, GroupId = x.Id })
+            .ToListAsync(cancellationToken);
+
+        var groupCountMap = linkedGroupPairs
+            .Concat(createdGroupPairs)
+            .GroupBy(x => x.AccountId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.GroupId).Distinct().Count());
+
+        foreach (var account in items)
+        {
+            account.ChannelCount = channelCountMap.TryGetValue(account.Id, out var channelCount) ? channelCount : 0;
+            account.GroupCount = groupCountMap.TryGetValue(account.Id, out var groupCount) ? groupCount : 0;
+        }
+    }
+
 }

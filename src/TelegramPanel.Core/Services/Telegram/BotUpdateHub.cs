@@ -17,7 +17,7 @@ namespace TelegramPanel.Core.Services.Telegram;
 public sealed class BotUpdateHub : IAsyncDisposable
 {
     // 固定允许的更新类型：覆盖当前项目使用场景（转发/监听/入群事件）
-    public const string AllowedUpdatesJson = "[\"message\",\"edited_message\",\"channel_post\",\"edited_channel_post\",\"my_chat_member\"]";
+    public const string AllowedUpdatesJson = "[\"message\",\"edited_message\",\"channel_post\",\"edited_channel_post\",\"my_chat_member\",\"chat_member\",\"chat_join_request\"]";
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TelegramBotApiClient _botApi;
@@ -26,9 +26,15 @@ public sealed class BotUpdateHub : IAsyncDisposable
 
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, BotPoller> _pollersByToken = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _pollingWebhookClearedTokens = new(StringComparer.Ordinal);
 
     // Webhook 模式下的接收器（token -> receiver），不启动轮询
-    private readonly Dictionary<string, BotWebhookReceiver> _webhookReceivers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, BotWebhookReceiver> _webhookReceivers = new(StringComparer.Ordinal);
+
+    private static readonly TimeSpan WebhookTokenCacheTtl = TimeSpan.FromMinutes(5);
+    private readonly SemaphoreSlim _webhookTokenCacheGate = new(1, 1);
+    private DateTimeOffset _webhookTokenCacheBuiltAtUtc = DateTimeOffset.MinValue;
+    private Dictionary<string, string> _botTokenByWebhookPathToken = new(StringComparer.Ordinal);
 
     public BotUpdateHub(
         IServiceScopeFactory scopeFactory,
@@ -57,10 +63,19 @@ public sealed class BotUpdateHub : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(token))
             return false;
 
+        if (_webhookReceivers.TryGetValue(token, out var fastReceiver))
+        {
+            fastReceiver.Inject(update);
+            return true;
+        }
+
+        BotWebhookReceiver receiver;
+
+        // 仅在“首次遇到某个 token”时加全局锁，避免高频 webhook 进入串行瓶颈。
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            if (!_webhookReceivers.TryGetValue(token, out var receiver))
+            if (!_webhookReceivers.TryGetValue(token, out receiver!))
             {
                 // 验证 token 有效性并创建 receiver
                 using var scope = _scopeFactory.CreateScope();
@@ -72,14 +87,76 @@ public sealed class BotUpdateHub : IAsyncDisposable
                 receiver = new BotWebhookReceiver(bot.Id, token, _scopeFactory, _logger);
                 _webhookReceivers[token] = receiver;
             }
-
-            receiver.Inject(update);
-            return true;
         }
         finally
         {
             _gate.Release();
         }
+
+        receiver.Inject(update);
+        return true;
+    }
+
+    /// <summary>
+    /// 将 Webhook 路径中的 token（推荐为 SHA256(token)）解析为真实的 bot token。
+    /// </summary>
+    public async Task<string?> ResolveBotTokenFromWebhookPathAsync(string pathToken, CancellationToken cancellationToken)
+    {
+        pathToken = (pathToken ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(pathToken))
+            return null;
+
+        // 兼容：若仍使用明文 bot token 作为路径（不推荐），直接返回。
+        if (WebhookTokenHelper.IsLikelyPlainBotToken(pathToken))
+            return pathToken;
+
+        if (!WebhookTokenHelper.IsSha256Hex(pathToken))
+            return null;
+
+        var builtAt = _webhookTokenCacheBuiltAtUtc;
+        if (builtAt != DateTimeOffset.MinValue
+            && DateTimeOffset.UtcNow - builtAt < WebhookTokenCacheTtl
+            && _botTokenByWebhookPathToken.TryGetValue(pathToken, out var cached))
+        {
+            return cached;
+        }
+
+        await _webhookTokenCacheGate.WaitAsync(cancellationToken);
+        try
+        {
+            builtAt = _webhookTokenCacheBuiltAtUtc;
+            if (builtAt == DateTimeOffset.MinValue || DateTimeOffset.UtcNow - builtAt >= WebhookTokenCacheTtl)
+                await RebuildWebhookTokenCacheAsync(cancellationToken);
+
+            return _botTokenByWebhookPathToken.TryGetValue(pathToken, out var token) ? token : null;
+        }
+        finally
+        {
+            _webhookTokenCacheGate.Release();
+        }
+    }
+
+    private async Task RebuildWebhookTokenCacheAsync(CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var botRepo = scope.ServiceProvider.GetRequiredService<IBotRepository>();
+        var bots = await botRepo.GetAllAsync();
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var bot in bots)
+        {
+            if (!bot.IsActive || string.IsNullOrWhiteSpace(bot.Token))
+                continue;
+
+            var token = bot.Token.Trim();
+            if (string.IsNullOrWhiteSpace(token))
+                continue;
+
+            map[WebhookTokenHelper.ToWebhookPathToken(token)] = token;
+        }
+
+        _botTokenByWebhookPathToken = map;
+        _webhookTokenCacheBuiltAtUtc = DateTimeOffset.UtcNow;
     }
 
     /// <summary>
@@ -148,6 +225,10 @@ public sealed class BotUpdateHub : IAsyncDisposable
             if (string.IsNullOrWhiteSpace(token))
                 throw new InvalidOperationException("Bot Token 为空");
 
+            // 重要：切回 Long Polling 时，Telegram 侧若残留 webhook，会导致 getUpdates 持续 409。
+            // 这里在首次订阅时兜底删一次 webhook（不丢 pending updates），避免“切模式后一直收不到更新”。
+            await EnsurePollingModeReadyAsync(token, cancellationToken);
+
             if (!_pollersByToken.TryGetValue(token, out var poller))
             {
                 poller = await BotPoller.CreateAsync(botId, token, bot.LastUpdateId, _scopeFactory, _botApi, _logger, cancellationToken);
@@ -172,6 +253,7 @@ public sealed class BotUpdateHub : IAsyncDisposable
         {
             pollers = _pollersByToken.Values.ToList();
             _pollersByToken.Clear();
+            _pollingWebhookClearedTokens.Clear();
 
             receivers = _webhookReceivers.Values.ToList();
             _webhookReceivers.Clear();
@@ -192,6 +274,33 @@ public sealed class BotUpdateHub : IAsyncDisposable
             try { r.Dispose(); }
             catch (Exception ex) { _logger.LogWarning(ex, "Dispose webhook receiver failed: {BotId}", r.BotId); }
         }
+    }
+
+    private async Task EnsurePollingModeReadyAsync(string token, CancellationToken cancellationToken)
+    {
+        if (_pollingWebhookClearedTokens.Contains(token))
+            return;
+
+        try
+        {
+            await _botApi.DeleteWebhookAsync(token, dropPendingUpdates: false, cancellationToken);
+            _pollingWebhookClearedTokens.Add(token);
+            _logger.LogInformation("Polling mode ensured: webhook deleted for bot token {TokenHint}", MaskToken(token));
+        }
+        catch (Exception ex)
+        {
+            // 不中断订阅流程：即使删 webhook 失败，也允许继续尝试轮询；
+            // 下次订阅会再次尝试，便于网络抖动后的自恢复。
+            _logger.LogWarning(ex, "Failed to delete webhook before polling (token={TokenHint}), will retry later", MaskToken(token));
+        }
+    }
+
+    private static string MaskToken(string token)
+    {
+        token = (token ?? string.Empty).Trim();
+        if (token.Length <= 8)
+            return "***";
+        return $"{token[..4]}...{token[^4..]}";
     }
 
     public sealed class BotUpdateSubscription : IAsyncDisposable
@@ -720,7 +829,9 @@ public sealed class BotUpdateHub : IAsyncDisposable
     {
         private static readonly BoundedChannelOptions SubscriberChannelOptions = new(512)
         {
-            SingleWriter = true,
+            // Webhook 端点可能并发调用 Inject，因此这里必须允许多写入者；
+            // 否则 SingleWriter=true 会触发 Channel 的非线程安全路径，导致偶发异常/卡死。
+            SingleWriter = false,
             SingleReader = true,
             FullMode = BoundedChannelFullMode.DropOldest
         };
@@ -737,6 +848,10 @@ public sealed class BotUpdateHub : IAsyncDisposable
 
         private readonly object _pendingLock = new();
         private readonly Queue<JsonElement> _pendingMyChatMember = new();
+
+        private long _latestUpdateId = -1;
+        private long _lastPersistedUpdateId = -1;
+        private int _persistLoopRunning = 0;
 
         public int BotId => _botId;
 
@@ -767,24 +882,8 @@ public sealed class BotUpdateHub : IAsyncDisposable
             // 保存 update_id 到数据库
             if (update.TryGetProperty("update_id", out var updateIdEl) && updateIdEl.TryGetInt64(out var updateId))
             {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        using var scope = _scopeFactory.CreateScope();
-                        var botRepo = scope.ServiceProvider.GetRequiredService<IBotRepository>();
-                        var bot = await botRepo.GetByIdAsync(_botId);
-                        if (bot != null && (!bot.LastUpdateId.HasValue || updateId > bot.LastUpdateId.Value))
-                        {
-                            bot.LastUpdateId = updateId;
-                            await botRepo.UpdateAsync(bot);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to save webhook update_id: {UpdateId}", updateId);
-                    }
-                });
+                UpdateLatestUpdateId(updateId);
+                EnsurePersistLoopRunning();
             }
 
             // 广播给订阅者
@@ -865,6 +964,73 @@ public sealed class BotUpdateHub : IAsyncDisposable
                     catch { /* ignore */ }
                 }
                 _subscribers.Clear();
+            }
+        }
+
+        private void UpdateLatestUpdateId(long updateId)
+        {
+            while (true)
+            {
+                var current = Interlocked.Read(ref _latestUpdateId);
+                if (updateId <= current)
+                    return;
+                if (Interlocked.CompareExchange(ref _latestUpdateId, updateId, current) == current)
+                    return;
+            }
+        }
+
+        private void EnsurePersistLoopRunning()
+        {
+            if (Interlocked.CompareExchange(ref _persistLoopRunning, 1, 0) != 0)
+                return;
+            _ = PersistLatestUpdateIdLoopAsync();
+        }
+
+        private async Task PersistLatestUpdateIdLoopAsync()
+        {
+            try
+            {
+                while (true)
+                {
+                    // 合并短时间内的多条 update：避免每条 update 都触发一次写库（线程池/SQLite 锁竞争）
+                    await Task.Delay(TimeSpan.FromSeconds(1));
+
+                    var latest = Interlocked.Read(ref _latestUpdateId);
+                    if (latest <= _lastPersistedUpdateId)
+                        break;
+
+                    try
+                    {
+                        using var scope = _scopeFactory.CreateScope();
+                        var botRepo = scope.ServiceProvider.GetRequiredService<IBotRepository>();
+                        var bot = await botRepo.GetByIdAsync(_botId);
+                        if (bot != null && (!bot.LastUpdateId.HasValue || latest > bot.LastUpdateId.Value))
+                        {
+                            bot.LastUpdateId = latest;
+                            await botRepo.UpdateAsync(bot);
+                        }
+                        _lastPersistedUpdateId = latest;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to save webhook update_id: botId={BotId} update_id={UpdateId}", _botId, latest);
+                    }
+
+                    // 若这段时间又来了新 update，则继续下一轮（保持单个循环，不扩散任务数）
+                    if (Interlocked.Read(ref _latestUpdateId) <= _lastPersistedUpdateId)
+                        break;
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _persistLoopRunning, 0);
+
+                // 处理竞态：若在“准备退出”期间又来了新 update，则再次启动循环
+                if (Interlocked.Read(ref _latestUpdateId) > _lastPersistedUpdateId
+                    && Interlocked.CompareExchange(ref _persistLoopRunning, 1, 0) == 0)
+                {
+                    _ = PersistLatestUpdateIdLoopAsync();
+                }
             }
         }
     }

@@ -6,16 +6,30 @@ using Microsoft.AspNetCore.HttpOverrides;
 using System.Security.Claims;
 using Serilog;
 using TelegramPanel.Core;
+using TelegramPanel.Core.Interfaces;
+using TelegramPanel.Core.Models;
 using TelegramPanel.Core.Services;
 using TelegramPanel.Core.Services.Telegram;
+using TelegramPanel.Core.Services.Proxy;
 using TelegramPanel.Data;
+using TelegramPanel.Modules;
 using TelegramPanel.Web.Modules;
+using TelegramPanel.Web.Api;
 using TelegramPanel.Web.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.Extensions.FileProviders;
+using System.Diagnostics;
+using System.Data.Common;
+
+TelegramLayerCompatibility.EnsureRegistered();
 
 // 诊断：对某个目录下的 *.json/*.session 做一次“可转换/可校验”检查（不写数据库）
-// 用法：dotnet run --project src/TelegramPanel.Web -- --diag-session-dir "D:/path/to/dir"
+// 用法：先通过 Telegram__Proxy__Server/Port 配置代理；若确需直连，额外传入 --allow-direct。
+// dotnet run --project src/TelegramPanel.Web -- --diag-session-dir "D:/path/to/dir"
 if (args.Length >= 2 && string.Equals(args[0], "--diag-session-dir", StringComparison.OrdinalIgnoreCase))
 {
     var dir = args[1];
@@ -35,6 +49,47 @@ if (args.Length >= 2 && string.Equals(args[0], "--diag-session-dir", StringCompa
         b.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information);
     });
     var logger = loggerFactory.CreateLogger("SessionDiag");
+    var diagConfiguration = new ConfigurationBuilder()
+        .AddEnvironmentVariables()
+        .Build();
+    var allowDirect = args.Skip(2)
+        .Any(x => string.Equals(x, "--allow-direct", StringComparison.OrdinalIgnoreCase));
+    ProxyConnectionOptions? diagProxy;
+    if (GlobalTelegramProxyConfiguration.GetSourceMode(diagConfiguration)
+        == GlobalTelegramProxyConfiguration.ExistingSourceMode)
+    {
+        var selectedProxyId = GlobalTelegramProxyConfiguration.GetSelectedProxyId(
+            diagConfiguration,
+            requireEnabled: false);
+        Console.Error.WriteLine(
+            $"诊断配置引用已有代理 #{selectedProxyId?.ToString() ?? "未选择"}，"
+            + "但独立诊断模式不会在应用启动前读取代理数据库。"
+            + "请改用 Telegram__Proxy__SourceMode=manual 并提供 Server/Port，"
+            + "或明确追加 --allow-direct 承担公网 IP 暴露风险。");
+        if (!allowDirect)
+            return;
+        diagProxy = null;
+    }
+    else
+    {
+        try
+        {
+            diagProxy = GlobalTelegramProxyConfiguration.Build(diagConfiguration);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"诊断代理配置无效：{ex.Message}");
+            return;
+        }
+    }
+
+    if (diagProxy == null && !allowDirect)
+    {
+        Console.Error.WriteLine(
+            "诊断可能连接 Telegram，已阻止默认直连。请配置 Telegram__Proxy__Server/Port，"
+            + "或明确追加 --allow-direct 承担公网 IP 暴露风险。");
+        return;
+    }
 
     var jsonFiles = Directory.EnumerateFiles(dir, "*.json", SearchOption.TopDirectoryOnly)
         .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
@@ -71,8 +126,14 @@ if (args.Length >= 2 && string.Equals(args[0], "--diag-session-dir", StringCompa
 
             if (!TryGetString(root, out var phone, "phone") || string.IsNullOrWhiteSpace(phone))
             {
-                Console.WriteLine($"[FAIL] {Path.GetFileName(jsonPath)}: 缺少 phone");
-                continue;
+                if (!TryGetString(root, out phone, "session_file", "sessionFile") || string.IsNullOrWhiteSpace(phone))
+                    phone = Path.GetFileNameWithoutExtension(jsonPath);
+
+                if (string.IsNullOrWhiteSpace(phone))
+                {
+                    Console.WriteLine($"[FAIL] {Path.GetFileName(jsonPath)}: 缺少 phone");
+                    continue;
+                }
             }
 
             _ = TryGetLong(root, out var userId, "user_id", "uid");
@@ -107,7 +168,8 @@ if (args.Length >= 2 && string.Equals(args[0], "--diag-session-dir", StringCompa
                         targetSessionPath: targetSessionPath,
                         phone: phone,
                         userId: userId,
-                        logger: logger);
+                        logger: logger,
+                        proxy: diagProxy);
                 }
                 else
                 {
@@ -118,7 +180,8 @@ if (args.Length >= 2 && string.Equals(args[0], "--diag-session-dir", StringCompa
                         targetSessionPath: targetSessionPath,
                         phone: phone,
                         userId: userId,
-                        logger: logger);
+                        logger: logger,
+                        proxy: diagProxy);
                 }
             }
             else
@@ -204,6 +267,12 @@ if (args.Length >= 2 && string.Equals(args[0], "--diag-session-dir", StringCompa
     }
 }
 
+// 旧容器的一键更新只会替换 /data/app-current，不会自动更新镜像内的 /entrypoint.sh。
+// 必须在创建主机前先安装新版入口并记录启动尝试，后续初始化失败时才能在下一次启动自动回滚。
+SelfUpdateStartupCoordinator.PrepareCurrentProcess(
+    AppContext.BaseDirectory,
+    message => Console.WriteLine($"[SelfUpdate] {message}"));
+
 var builder = WebApplication.CreateBuilder(args);
 
 // 可选的本地覆盖配置（不要提交到仓库）
@@ -232,19 +301,116 @@ catch (FileNotFoundException ex)
     Console.Error.WriteLine($"Ignoring missing appsettings.local.json: {ex.Message}");
 }
 
+// 自更新会切换 ContentRootPath。数据库、后台凭据和 Session 必须在此之前统一到持久化目录，
+// 并尝试从旧的 /app、app-current、app-previous 目录恢复，避免升级后打开空库或重新生成默认凭据。
+PersistentStoragePaths persistentStorage;
+try
+{
+    persistentStorage = PersistentStorageBootstrapper.Initialize(
+        builder.Configuration,
+        builder.Environment,
+        message => Console.WriteLine($"[Storage] {message}"));
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"Failed to initialize persistent storage paths: {ex.Message}");
+    throw;
+}
+
 // 配置 Serilog
-Log.Logger = new LoggerConfiguration()
-    .ReadFrom.Configuration(builder.Configuration)
-    .Enrich.FromLogContext()
-    .WriteTo.Console()
-    .WriteTo.File("logs/telegram-panel-.log", rollingInterval: RollingInterval.Day)
-    .CreateLogger();
+static int ReadRetainedFileCountLimit(IConfiguration configuration)
+{
+    var raw = (configuration["Serilog:RetainedFileCountLimit"] ?? "").Trim();
+    if (!int.TryParse(raw, out var v))
+        return 30;
+    if (v < 1) return 1;
+    if (v > 3650) return 3650;
+    return v;
+}
+
+static string ResolveSerilogFilePath(IConfiguration configuration, IWebHostEnvironment environment)
+{
+    var configured = (configuration["Serilog:FilePath"] ?? "").Trim();
+    if (!string.IsNullOrWhiteSpace(configured))
+        return StoragePathResolver.ResolveRelativeToBase(configured, environment.ContentRootPath);
+
+    var persistentRoot = StoragePathResolver.ResolvePersistentRoot(configuration);
+    if (!string.IsNullOrWhiteSpace(persistentRoot))
+        return Path.Combine(persistentRoot, "logs", "telegram-panel-.log");
+
+    return Path.Combine("logs", "telegram-panel-.log");
+}
+
+var retainedFileCountLimit = ReadRetainedFileCountLimit(builder.Configuration);
+var serilogEnabled = builder.Configuration.GetValue("Serilog:Enabled", false);
+var serilogFilePath = ResolveSerilogFilePath(builder.Configuration, builder.Environment);
+
+var loggerConfig = new LoggerConfiguration()
+    .Enrich.FromLogContext();
+
+if (serilogEnabled)
+{
+    loggerConfig = loggerConfig
+        .ReadFrom.Configuration(builder.Configuration)
+        // buffered=true：降低磁盘抖动/IO 阻塞导致的请求卡顿风险（尤其是低配 VPS/挂载卷/杀软扫描场景）
+        .WriteTo.File(
+            serilogFilePath,
+            rollingInterval: RollingInterval.Day,
+            retainedFileCountLimit: retainedFileCountLimit,
+            buffered: true,
+            flushToDiskInterval: TimeSpan.FromSeconds(1));
+}
+else
+{
+    // 关闭“详细日志输出”时，仍保留 Error/Fatal：避免进程异常退出却完全看不到日志。
+    loggerConfig = loggerConfig.MinimumLevel.Error();
+}
+
+loggerConfig = loggerConfig.WriteTo.Console();
+Log.Logger = loggerConfig.CreateLogger();
 
 builder.Host.UseSerilog();
 
+// 兜底：即使日志配置被关闭/过滤，也尽量把致命异常打到 stderr
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    try
+    {
+        if (e.ExceptionObject is Exception ex)
+            Log.Fatal(ex, "Unhandled exception (IsTerminating={IsTerminating})", e.IsTerminating);
+        else
+            Log.Fatal("Unhandled exception: {ExceptionObject} (IsTerminating={IsTerminating})", e.ExceptionObject, e.IsTerminating);
+    }
+    catch
+    {
+        // ignore
+    }
+};
+
+TaskScheduler.UnobservedTaskException += (_, e) =>
+{
+    try
+    {
+        Log.Error(e.Exception, "Unobserved task exception");
+    }
+    catch
+    {
+        // ignore
+    }
+    finally
+    {
+        e.SetObserved();
+    }
+};
+
 // Add services to the container.
 builder.Services.AddRazorComponents()
-    .AddInteractiveServerComponents();
+    .AddInteractiveServerComponents(options =>
+    {
+        options.DetailedErrors = true;
+        options.DisconnectedCircuitRetentionPeriod = TimeSpan.FromMinutes(5);
+        options.DisconnectedCircuitMaxRetained = 200;
+    });
 
 // MudBlazor
 builder.Services.AddMudServices();
@@ -257,9 +423,13 @@ try
     var keysPath = configuredKeysPath;
     if (string.IsNullOrWhiteSpace(keysPath))
     {
-        keysPath = Directory.Exists("/data")
-            ? "/data/keys"
-            : Path.Combine(builder.Environment.ContentRootPath, "data-protection-keys");
+        keysPath = Path.Combine(
+            StoragePathResolver.ResolveWritableRoot(builder.Configuration, builder.Environment),
+            Directory.Exists("/data") ? "keys" : "data-protection-keys");
+    }
+    else
+    {
+        keysPath = StoragePathResolver.ResolveRelativeToBase(keysPath, builder.Environment.ContentRootPath);
     }
 
     Directory.CreateDirectory(keysPath);
@@ -285,52 +455,90 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
 });
 
 // 数据库上下文
-var configuredConnectionString = builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? "Data Source=telegram-panel.db";
+// 持久化初始化失败会在上方终止启动，禁止回退到可能创建空库的临时路径。
+var connectionString = persistentStorage.ConnectionString;
 
-// 统一 SQLite 数据库路径为 ContentRoot 下的文件，避免因工作目录不同导致连到错误的 db（从而出现 no such table）
-var connectionString = configuredConnectionString;
+// 云端场景（容器/卷/后台任务）更容易出现 SQLite 写锁：这里统一增强连接参数，提升抗锁能力
 try
 {
-    var dataSourcePrefix = "Data Source=";
-    var trimmed = configuredConnectionString.Trim();
-    if (trimmed.StartsWith(dataSourcePrefix, StringComparison.OrdinalIgnoreCase))
+    var csb = new SqliteConnectionStringBuilder(connectionString)
     {
-        var dataSource = trimmed.Substring(dataSourcePrefix.Length).Trim().Trim('"');
-        if (!Path.IsPathRooted(dataSource))
-        {
-            var absolute = Path.Combine(builder.Environment.ContentRootPath, dataSource);
-            connectionString = $"{dataSourcePrefix}{absolute}";
-        }
-    }
+        // 等待写锁释放的最大秒数（映射/等价于 busy_timeout 行为）
+        DefaultTimeout = 30,
+        Pooling = true
+    };
+    connectionString = csb.ToString();
 }
 catch (Exception ex)
 {
-    Log.Warning(ex, "Failed to normalize sqlite connection string, using configured value");
-    connectionString = configuredConnectionString;
+    Log.Warning(ex, "Failed to enhance sqlite connection string, using current value");
 }
 builder.Services.AddTelegramPanelData(connectionString);
 
 // Telegram Panel 核心服务
 builder.Services.AddTelegramPanelCore();
+builder.Services.AddSingleton<AccountLoginProxyStateStore>();
+builder.Services.AddSingleton<IWarpProxyUsageGuard>(serviceProvider =>
+    serviceProvider.GetRequiredService<AccountLoginProxyStateStore>());
+builder.Services.AddScoped<AccountLoginProxyCoordinator>();
+builder.Services.AddHostedService<AccountLoginProxyCleanupService>();
+builder.Services.AddSingleton<WarpMaintenanceState>();
+builder.Services.AddHostedService<WarpMaintenanceBackgroundService>();
+builder.Services.AddHostedService<ProxyEgressMaintenanceBackgroundService>();
 builder.Services.AddScoped<AccountExportService>();
 builder.Services.AddScoped<DataSyncService>();
 builder.Services.AddScoped<UiPreferencesService>();
 builder.Services.AddScoped<BotAdminPresetsService>();
+builder.Services.AddScoped<BotChannelAdminDefaultsService>();
 builder.Services.AddScoped<ChannelAdminDefaultsService>();
 builder.Services.AddScoped<ChannelAdminPresetsService>();
 builder.Services.AddScoped<ChannelInvitePresetsService>();
+builder.Services.AddSingleton<ImageAssetStorageService>();
+builder.Services.AddSingleton<CronExpressionService>();
+builder.Services.AddScoped<DataDictionaryService>();
+builder.Services.AddScoped<TemplateRenderingService>();
+builder.Services.AddScoped<ScheduledTaskService>();
 builder.Services.Configure<UpdateCheckOptions>(builder.Configuration.GetSection("UpdateCheck"));
+builder.Services.Configure<SelfUpdateOptions>(builder.Configuration.GetSection("SelfUpdate"));
+builder.Services.Configure<AiOpenAiOptions>(builder.Configuration.GetSection("AI:OpenAI"));
 builder.Services.AddSingleton<UpdateCheckService>();
+builder.Services.AddSingleton<UpdateModeStore>();
+builder.Services.AddSingleton<AppSelfUpdateService>();
 builder.Services.Configure<PanelTimeZoneOptions>(builder.Configuration.GetSection("System"));
 builder.Services.AddSingleton<PanelTimeZoneService>();
+builder.Services.AddScoped<UserChatActiveAiVerificationService>();
+builder.Services.AddSingleton<TelegramPanelAiService>();
+builder.Services.AddSingleton<TelegramPanel.Modules.ITelegramPanelAiService>(sp => sp.GetRequiredService<TelegramPanelAiService>());
+builder.Services.AddScoped<IModuleTaskHandler, BotChannelSetAdminsByAccountTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, BotSetAdminsTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, BotChannelInviteUsersTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, UserJoinSubscribeTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, UserChatActiveTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, ChannelInviteUsersTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, GroupInviteUsersTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, ChannelGroupPrivateCreateTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, ChannelGroupPublicizeTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, AutoChangeLoginEmailTaskHandler>();
+builder.Services.AddScoped<IModuleTaskHandler, AccountAutoSyncTaskHandler>();
+builder.Services.AddSingleton<ModuleTaskLifecycleService>();
+builder.Services.AddSingleton<BatchTaskExecutionControlService>();
+builder.Services.AddSingleton<BatchTaskStartupRecoveryService>();
 builder.Services.AddHostedService<BatchTaskBackgroundService>();
+builder.Services.AddHostedService<PersistentModuleTaskBackgroundService>();
+builder.Services.AddHostedService<ScheduledTaskBackgroundService>();
 builder.Services.AddHostedService<AccountDataAutoSyncBackgroundService>();
+builder.Services.AddHostedService<AccountStatusAutoRefreshBackgroundService>();
 builder.Services.AddHostedService<BotAutoSyncBackgroundService>();
 builder.Services.AddHostedService<TelegramPanel.Web.Services.WebhookRegistrationService>();
 builder.Services.AddHttpClient<TelegramBotApiClient>();
+builder.Services.AddHttpClient<TelegramPanel.Web.Services.CloudMailClient>();
+builder.Services.AddHttpClient(nameof(TelegramPanelAiService));
+builder.Services.AddScoped<TelegramPanel.Modules.ITelegramEmailCodeService, TelegramPanel.Web.Services.TelegramEmailCodeService>();
 builder.Services.AddModuleSystem(builder.Configuration, builder.Environment);
 builder.Services.AddSingleton<AppRestartService>();
+builder.Services.Configure<BucketBackupOptions>(builder.Configuration.GetSection("BucketBackup"));
+builder.Services.AddHttpClient(nameof(BucketBackupService));
+builder.Services.AddSingleton<BucketBackupService>();
 
 // 后台账号密码验证（Cookie 登录）
 builder.Services.Configure<AdminAuthOptions>(builder.Configuration.GetSection("AdminAuth"));
@@ -390,6 +598,8 @@ using (var scope = app.Services.CreateScope())
         if (conn.State != System.Data.ConnectionState.Open)
             conn.Open();
 
+        ConfigureSqliteConnection(conn);
+
         List<string> tables;
         using (var cmd = conn.CreateCommand())
         {
@@ -421,8 +631,11 @@ using (var scope = app.Services.CreateScope())
             }
             else
             {
-                var baseline = migrations.First(); // EF 返回的顺序为从旧到新
-                EnsureMigrationsHistoryBaseline(conn, baseline);
+                var baselinedMigrations = LegacyDatabaseMigrationBaseline.Apply(conn, migrations);
+                Log.Warning(
+                    "Database has schema tables but no __EFMigrationsHistory; reconstructed history through {MigrationId} ({Count} migrations)",
+                    baselinedMigrations[^1],
+                    baselinedMigrations.Count);
                 db.Database.Migrate();
             }
         }
@@ -469,6 +682,34 @@ using (var scope = app.Services.CreateScope())
             }
         }
 
+        void ConfigureSqliteConnection(System.Data.Common.DbConnection connection)
+        {
+            // journal_mode=WAL 会持久化到库；busy_timeout 是连接级参数
+            // 这里提前设置，减少在云端并发写入时的 “database is locked” 概率
+            try
+            {
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.CommandText = "PRAGMA journal_mode=WAL;";
+                    _ = cmd.ExecuteScalar();
+                }
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.CommandText = "PRAGMA synchronous=NORMAL;";
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.CommandText = "PRAGMA busy_timeout=5000;";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to configure sqlite pragmas");
+            }
+        }
+
         void EnsureSqliteColumn(System.Data.Common.DbConnection connection, string tableName, string columnName, string columnType)
         {
             try
@@ -502,63 +743,6 @@ using (var scope = app.Services.CreateScope())
             }
         }
 
-        void EnsureMigrationsHistoryBaseline(System.Data.Common.DbConnection connection, string baselineMigrationId)
-        {
-            try
-            {
-                // 创建历史表（若不存在）
-                using (var cmd = connection.CreateCommand())
-                {
-                    cmd.CommandText = @"
-CREATE TABLE IF NOT EXISTS __EFMigrationsHistory (
-    MigrationId TEXT NOT NULL CONSTRAINT PK___EFMigrationsHistory PRIMARY KEY,
-    ProductVersion TEXT NOT NULL
-);";
-                    cmd.ExecuteNonQuery();
-                }
-
-                // 若 baseline 已存在则跳过
-                using (var check = connection.CreateCommand())
-                {
-                    check.CommandText = "SELECT COUNT(1) FROM __EFMigrationsHistory WHERE MigrationId = $id;";
-                    var p = check.CreateParameter();
-                    p.ParameterName = "$id";
-                    p.Value = baselineMigrationId;
-                    check.Parameters.Add(p);
-                    var exists = Convert.ToInt32(check.ExecuteScalar()) > 0;
-                    if (exists)
-                        return;
-                }
-
-                var productVersion = typeof(Microsoft.EntityFrameworkCore.DbContext)
-                    .Assembly
-                    .GetName()
-                    .Version?
-                    .ToString(3) ?? "8.0.0";
-
-                using (var insert = connection.CreateCommand())
-                {
-                    insert.CommandText = "INSERT INTO __EFMigrationsHistory (MigrationId, ProductVersion) VALUES ($id, $v);";
-                    var p1 = insert.CreateParameter();
-                    p1.ParameterName = "$id";
-                    p1.Value = baselineMigrationId;
-                    insert.Parameters.Add(p1);
-
-                    var p2 = insert.CreateParameter();
-                    p2.ParameterName = "$v";
-                    p2.Value = productVersion;
-                    insert.Parameters.Add(p2);
-
-                    insert.ExecuteNonQuery();
-                }
-
-                Log.Warning("Database has schema tables but no __EFMigrationsHistory; baselined migrations history with {MigrationId}", baselineMigrationId);
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Failed to baseline __EFMigrationsHistory; database might not auto-upgrade");
-            }
-        }
     }
     catch (Exception ex)
     {
@@ -566,6 +750,10 @@ CREATE TABLE IF NOT EXISTS __EFMigrationsHistory (
         throw;
     }
 }
+
+PersistentStorageBootstrapper.CompleteDatabaseMigration(
+    persistentStorage,
+    message => Log.Information("[Storage] {Message}", message));
 
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
@@ -587,14 +775,140 @@ if (hasHttpsEndpoint)
 
 // 静态文件（包括 MudBlazor 等 NuGet 包的静态 Web 资源）
 app.UseStaticFiles();
+var spaRoot = Path.Combine(app.Environment.WebRootPath ?? Path.Combine(app.Environment.ContentRootPath, "wwwroot"), "panel-spa");
+if (Directory.Exists(spaRoot))
+{
+    app.UseStaticFiles(new StaticFileOptions
+    {
+        FileProvider = new PhysicalFileProvider(spaRoot),
+        RequestPath = "/ui",
+        OnPrepareResponse = context =>
+        {
+            var fileName = context.File.Name;
+            var requestPath = context.Context.Request.Path.Value ?? string.Empty;
+            var headers = context.Context.Response.Headers;
+
+            if (string.Equals(fileName, "index.html", StringComparison.OrdinalIgnoreCase))
+            {
+                headers.CacheControl = "no-cache, no-store, must-revalidate";
+                headers.Pragma = "no-cache";
+                headers.Expires = "0";
+                return;
+            }
+
+            if (requestPath.StartsWith("/ui/assets/", StringComparison.OrdinalIgnoreCase))
+                headers.CacheControl = "public, max-age=31536000, immutable";
+        }
+    });
+}
+var persistentUploadsRoot = StoragePathResolver.ResolvePersistentRoot(app.Configuration);
+if (!string.IsNullOrWhiteSpace(persistentUploadsRoot))
+{
+    var uploadsRoot = Path.Combine(persistentUploadsRoot, "uploads");
+    Directory.CreateDirectory(uploadsRoot);
+    app.UseStaticFiles(new StaticFileOptions
+    {
+        FileProvider = new PhysicalFileProvider(uploadsRoot),
+        RequestPath = "/uploads"
+    });
+}
+
+var legacyUiRedirects = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+{
+    ["/"] = "/ui/dashboard",
+    ["/dashboard"] = "/ui/dashboard",
+    ["/admin/password"] = "/ui/admin/password",
+    ["/tasks"] = "/ui/tasks",
+    ["/accounts"] = "/ui/accounts",
+    ["/accounts/import"] = "/ui/accounts/import",
+    ["/accounts/login"] = "/ui/accounts/login",
+    ["/accounts/categories"] = "/ui/accounts/categories",
+    ["/channels"] = "/ui/channels",
+    ["/channels/create"] = "/ui/channels/create",
+    ["/channels/groups"] = "/ui/channels/groups",
+    ["/groups"] = "/ui/groups",
+    ["/groups/create"] = "/ui/groups/create",
+    ["/groups/categories"] = "/ui/groups/categories",
+    ["/bots"] = "/ui/bots",
+    ["/bots/channels"] = "/ui/bots/channels",
+    ["/data-dictionaries"] = "/ui/data-dictionaries",
+    ["/dictionaries"] = "/ui/data-dictionaries",
+    ["/modules"] = "/ui/modules",
+    ["/apis"] = "/ui/apis",
+    ["/settings"] = "/ui/settings"
+};
+var redirectLegacyToVue = string.Equals(
+    app.Configuration["PanelSpa:RedirectLegacy"] ?? "true",
+    "true",
+    StringComparison.OrdinalIgnoreCase);
+var moduleContributions = app.Services.GetRequiredService<ModuleContributionRegistry>();
+
+// 已复刻的后台页面默认交给 Vue；后台模块页面也默认进入 Vue 宿主。
+// 只有显式 legacy=1 才打开旧 Razor/Blazor 兼容页，公开模块端点仍由模块自己处理。
+app.Use(async (context, next) =>
+{
+    var requestPath = context.Request.Path.Value ?? string.Empty;
+    var normalizedRequestPath = requestPath.Length > 1 ? requestPath.TrimEnd('/') : requestPath;
+    var hasLegacyTarget = legacyUiRedirects.TryGetValue(normalizedRequestPath, out var legacyTarget);
+    var vueTarget = hasLegacyTarget ? legacyTarget : null;
+    if (vueTarget == null
+        && TryResolveExtensionModuleVueRoute(normalizedRequestPath, moduleContributions, out var extensionVueTarget))
+    {
+        vueTarget = extensionVueTarget;
+    }
+
+    if (redirectLegacyToVue
+        && Directory.Exists(spaRoot)
+        && (HttpMethods.IsGet(context.Request.Method) || HttpMethods.IsHead(context.Request.Method))
+        && !context.Request.Query.ContainsKey("legacy")
+        && vueTarget != null
+        && !string.Equals(normalizedRequestPath, vueTarget, StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.Redirect(vueTarget + context.Request.QueryString, permanent: false);
+        return;
+    }
+
+    await next();
+});
+
+static bool TryResolveExtensionModuleVueRoute(
+    string normalizedRequestPath,
+    ModuleContributionRegistry contributions,
+    out string vueTarget)
+{
+    vueTarget = string.Empty;
+    if (!ExtensionModuleRoute.TryParse(normalizedRequestPath, out var moduleId, out var pageKey))
+        return false;
+
+    var matched = contributions.Pages.Any(page =>
+        string.Equals(page.Module.Id, moduleId, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(page.Definition.Key, pageKey, StringComparison.OrdinalIgnoreCase))
+        || contributions.NavItems.Any(item =>
+            string.Equals(item.Module.Id, moduleId, StringComparison.OrdinalIgnoreCase)
+            && ExtensionModuleRoute.Matches(item.Definition.Href, moduleId, pageKey));
+    if (!matched)
+        return false;
+
+    vueTarget = ExtensionModuleRoute.BuildVuePath(moduleId, pageKey);
+    return true;
+}
+
+app.UseRouting();
 
 app.UseAntiforgery();
 
 // Serilog 请求日志
-app.UseSerilogRequestLogging();
+if (serilogEnabled)
+    app.UseSerilogRequestLogging();
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.MapGet("/healthz", () => Results.Json(new
+{
+    status = "ok",
+    at = DateTimeOffset.UtcNow
+})).AllowAnonymous();
 
 // Modules (built-in & installed): endpoints mapping
 app.MapInstalledModules();
@@ -623,9 +937,9 @@ app.MapGet("/login", async (HttpContext http, IConfiguration configuration, Admi
     var title = "Telegram Panel 登录";
     var msg = error == "1" ? "<div class=\"mud-alert mud-alert-filled mud-alert-filled-error\" style=\"margin-bottom:12px;\">账号或密码错误</div>" : "";
     var disabledMsg = configured ? "" : "<div class=\"mud-alert mud-alert-filled mud-alert-filled-warning\" style=\"margin-bottom:12px;\">后台验证未启用</div>";
-    var initialUsername = System.Net.WebUtility.HtmlEncode((configuration["AdminAuth:InitialUsername"] ?? "admin").Trim());
-    var initialPassword = System.Net.WebUtility.HtmlEncode((configuration["AdminAuth:InitialPassword"] ?? "admin123").Trim());
-    var initialHint = configured
+    var initialUsername = System.Net.WebUtility.HtmlEncode((configuration["AdminAuth:InitialUsername"] ?? "tgpanel").Trim());
+    var initialPassword = System.Net.WebUtility.HtmlEncode((configuration["AdminAuth:InitialPassword"] ?? "tgpanel123").Trim());
+    var initialHint = configured && credentialStore.MustChangePassword
         ? $"<div class=\"mud-alert mud-alert-filled mud-alert-filled-info\" style=\"margin-bottom:12px;\">初始账号：<b>{initialUsername}</b>，初始密码：<b>{initialPassword}</b>（首次登录后请立即修改）</div>"
         : "";
 
@@ -709,6 +1023,32 @@ app.MapGet("/logout", async (HttpContext http) =>
 
 var adminAuthEnabled = adminCredentials.Enabled;
 
+app.MapPanelAdminApi(adminAuthEnabled);
+
+if (Directory.Exists(spaRoot))
+{
+    app.MapMethods("/ui/assets/{**path}", new[] { HttpMethods.Get, HttpMethods.Head }, (HttpContext http) =>
+    {
+        http.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
+        http.Response.Headers.Pragma = "no-cache";
+        http.Response.Headers.Expires = "0";
+        return Results.NotFound();
+    }).AllowAnonymous();
+
+    app.MapMethods("/ui/{**path}", new[] { HttpMethods.Get, HttpMethods.Head }, async (HttpContext http) =>
+    {
+        var indexPath = Path.Combine(spaRoot, "index.html");
+        if (!File.Exists(indexPath))
+            return Results.NotFound();
+
+        http.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
+        http.Response.Headers.Pragma = "no-cache";
+        http.Response.Headers.Expires = "0";
+        var html = await File.ReadAllTextAsync(indexPath, http.RequestAborted);
+        return Results.Content(html, "text/html; charset=utf-8");
+    }).AllowAnonymous();
+}
+
 var razor = app.MapRazorComponents<TelegramPanel.Web.Components.App>()
     .AddInteractiveServerRenderMode();
 if (adminAuthEnabled)
@@ -735,8 +1075,19 @@ var accountsZipDownload = app.MapGet("/downloads/accounts.zip", async (
     var all = (await accountManagement.GetAllAccountsAsync()).ToList();
     var accounts = ids == null ? all : all.Where(a => ids.Contains(a.Id)).ToList();
 
-    var zipBytes = await exporter.BuildAccountsZipAsync(accounts, cancellationToken);
-    var fileName = $"telegram-panel-accounts-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip";
+    var formatRaw = (http.Request.Query["format"].ToString() ?? string.Empty).Trim();
+    var format = string.Equals(formatRaw, "tdata", StringComparison.OrdinalIgnoreCase)
+        ? AccountExportFormat.Tdata
+        : AccountExportFormat.Telethon;
+
+    var zipBytes = await exporter.BuildAccountsZipAsync(accounts, cancellationToken, format);
+    var formatName = format == AccountExportFormat.Tdata ? "tdata" : "telethon";
+    var fileName = $"telegram-panel-accounts-{formatName}-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip";
+
+    // 下载文件禁止缓存，避免浏览器复用旧的 accounts.zip 导致“重复拿到旧导出包”。
+    http.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate, max-age=0";
+    http.Response.Headers.Pragma = "no-cache";
+    http.Response.Headers.Expires = "0";
     return Results.File(zipBytes, "application/zip", fileName);
 }).DisableAntiforgery();
 if (adminAuthEnabled)
@@ -795,6 +1146,150 @@ var botInvitesDownload = app.MapGet("/downloads/bots/{botId:int}/invites.txt", a
 if (adminAuthEnabled)
     botInvitesDownload.RequireAuthorization();
 
+// 下载：导出频道邀请链接（文本）
+var channelInvitesDownload = app.MapGet("/downloads/channels/invites.txt", async (
+    HttpContext http,
+    ChannelManagementService channelManagement,
+    IChannelService channelService,
+    CancellationToken cancellationToken) =>
+{
+    var idsRaw = http.Request.Query["ids"].ToString();
+    IReadOnlyList<long> telegramIds;
+    if (string.IsNullOrWhiteSpace(idsRaw))
+    {
+        telegramIds = (await channelManagement.GetAllChannelsAsync()).Select(x => x.TelegramId).Where(x => x > 0).Distinct().ToList();
+    }
+    else
+    {
+        telegramIds = idsRaw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => long.TryParse(s, out var x) ? x : 0)
+            .Where(x => x > 0)
+            .Distinct()
+            .ToList();
+    }
+
+    var preferredAccountIdRaw = http.Request.Query["accountId"].ToString();
+    var preferredAccountId = int.TryParse(preferredAccountIdRaw, out var x) ? x : 0;
+    if (preferredAccountId <= 0)
+        preferredAccountId = 0;
+
+    var lines = new List<string>
+    {
+        $"# ExportedAtUtc: {DateTime.UtcNow:O}",
+        "# Format: <TelegramId>\\t<Title>\\t<Link>",
+        ""
+    };
+
+    foreach (var telegramId in telegramIds)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var ch = await channelManagement.GetChannelByTelegramIdAsync(telegramId);
+        if (ch == null)
+        {
+            lines.Add($"{telegramId}\t(unknown)\t(频道不存在)");
+            continue;
+        }
+
+        var executeAccountId = await channelManagement.ResolveExecuteAccountIdAsync(ch, preferredAccountId: preferredAccountId);
+        if (executeAccountId is not > 0)
+        {
+            lines.Add($"{telegramId}\t{ch.Title}\t(无可用执行账号)");
+            continue;
+        }
+
+        try
+        {
+            var link = await channelService.ExportJoinLinkAsync(executeAccountId.Value, telegramId);
+            lines.Add($"{telegramId}\t{ch.Title}\t{link}");
+        }
+        catch
+        {
+            lines.Add($"{telegramId}\t{ch.Title}\t(无法生成/不可见/无权限)");
+        }
+    }
+
+    var text = string.Join(Environment.NewLine, lines);
+    var bytes = System.Text.Encoding.UTF8.GetBytes(text);
+    var fileName = $"telegram-panel-channel-invites-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+    return Results.File(bytes, "text/plain; charset=utf-8", fileName);
+}).DisableAntiforgery();
+if (adminAuthEnabled)
+    channelInvitesDownload.RequireAuthorization();
+
+// 下载：导出群组加入链接（文本）
+var groupInvitesDownload = app.MapGet("/downloads/groups/invites.txt", async (
+    HttpContext http,
+    GroupManagementService groupManagement,
+    IGroupService groupService,
+    CancellationToken cancellationToken) =>
+{
+    var idsRaw = http.Request.Query["ids"].ToString();
+    IReadOnlyList<long> telegramIds;
+    if (string.IsNullOrWhiteSpace(idsRaw))
+    {
+        telegramIds = (await groupManagement.GetAllGroupsAsync()).Select(x => x.TelegramId).Where(x => x > 0).Distinct().ToList();
+    }
+    else
+    {
+        telegramIds = idsRaw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => long.TryParse(s, out var x) ? x : 0)
+            .Where(x => x > 0)
+            .Distinct()
+            .ToList();
+    }
+
+    var preferredAccountIdRaw = http.Request.Query["accountId"].ToString();
+    var preferredAccountId = int.TryParse(preferredAccountIdRaw, out var x) ? x : 0;
+    if (preferredAccountId <= 0)
+        preferredAccountId = 0;
+
+    var lines = new List<string>
+    {
+        $"# ExportedAtUtc: {DateTime.UtcNow:O}",
+        "# Format: <TelegramId>\\t<Title>\\t<Link>",
+        ""
+    };
+
+    foreach (var telegramId in telegramIds)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var group = await groupManagement.GetGroupByTelegramIdAsync(telegramId);
+        if (group == null)
+        {
+            lines.Add($"{telegramId}\t(unknown)\t(群组不存在)");
+            continue;
+        }
+
+        var executeAccountId = await groupManagement.ResolveExecuteAccountIdAsync(group, preferredAccountId: preferredAccountId);
+        if (executeAccountId is not > 0)
+        {
+            lines.Add($"{telegramId}\t{group.Title}\t(无可用执行账号)");
+            continue;
+        }
+
+        try
+        {
+            var link = await groupService.ExportJoinLinkAsync(executeAccountId.Value, telegramId);
+            lines.Add($"{telegramId}\t{group.Title}\t{link}");
+        }
+        catch
+        {
+            lines.Add($"{telegramId}\t{group.Title}\t(无法生成/不可见/无权限)");
+        }
+    }
+
+    var text = string.Join(Environment.NewLine, lines);
+    var bytes = System.Text.Encoding.UTF8.GetBytes(text);
+    var fileName = $"telegram-panel-group-invites-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+    return Results.File(bytes, "text/plain; charset=utf-8", fileName);
+}).DisableAntiforgery();
+if (adminAuthEnabled)
+    groupInvitesDownload.RequireAuthorization();
+
 // Telegram Bot Webhook 端点
 // 接收 Telegram 服务器推送的更新，用于 Webhook 模式
 app.MapPost("/api/bot/webhook/{secretToken}", async (
@@ -818,11 +1313,6 @@ app.MapPost("/api/bot/webhook/{secretToken}", async (
         }
     }
 
-    // 从路径中的 secretToken 提取 bot token
-    // 我们使用 SHA256(bot_token) 作为 URL 中的 secret，避免暴露真实 token
-    // 但更简单的方式是直接用 bot token（Telegram 官方也是这么做的）
-    // 这里我们假设 secretToken 就是 bot token 的一部分（安全的做法是用 hash）
-
     // 读取请求体
     using var reader = new System.IO.StreamReader(http.Request.Body);
     var body = await reader.ReadToEndAsync(cancellationToken);
@@ -838,10 +1328,16 @@ app.MapPost("/api/bot/webhook/{secretToken}", async (
         using var doc = System.Text.Json.JsonDocument.Parse(body);
         var update = doc.RootElement;
 
-        // 尝试从数据库查找匹配的 bot token
-        // 由于 URL 中不应该暴露完整 token，我们需要一个映射机制
-        // 这里简化处理：直接用 secretToken 作为查找键
-        var success = await updateHub.InjectWebhookUpdateAsync(secretToken, update.Clone(), cancellationToken);
+        var botToken = await updateHub.ResolveBotTokenFromWebhookPathAsync(secretToken, cancellationToken);
+        if (string.IsNullOrWhiteSpace(botToken))
+        {
+            logger.LogWarning("Webhook update rejected: unknown or inactive bot");
+            return Results.NotFound();
+        }
+
+        var sw = Stopwatch.StartNew();
+        var success = await updateHub.InjectWebhookUpdateAsync(botToken, update.Clone(), cancellationToken);
+        sw.Stop();
 
         if (!success)
         {
@@ -849,8 +1345,11 @@ app.MapPost("/api/bot/webhook/{secretToken}", async (
             return Results.NotFound();
         }
 
-        logger.LogDebug("Webhook update processed: update_id={UpdateId}",
-            update.TryGetProperty("update_id", out var uid) ? uid.GetInt64() : 0);
+        var updateId = update.TryGetProperty("update_id", out var uid) ? uid.GetInt64() : 0;
+        if (sw.Elapsed > TimeSpan.FromSeconds(2))
+            logger.LogWarning("Webhook update processed slowly: update_id={UpdateId} elapsed_ms={ElapsedMs}", updateId, (long)sw.Elapsed.TotalMilliseconds);
+        else
+            logger.LogDebug("Webhook update processed: update_id={UpdateId} elapsed_ms={ElapsedMs}", updateId, (long)sw.Elapsed.TotalMilliseconds);
 
         return Results.Ok();
     }
@@ -864,6 +1363,262 @@ app.MapPost("/api/bot/webhook/{secretToken}", async (
 // TODO: Hangfire Dashboard
 // app.MapHangfireDashboard("/hangfire");
 
-Log.Information("Telegram Panel started");
+try
+{
+    await app.StartAsync();
 
-app.Run();
+    // 只有主机与全部托管服务真正启动成功后，才确认自更新版本可用。
+    SelfUpdateStartupCoordinator.TryConfirmSuccessfulStartup(
+        AppContext.BaseDirectory,
+        VersionService.Version,
+        message => Log.Information("[SelfUpdate] {Message}", message));
+
+    Log.Information("Telegram Panel started");
+    await app.WaitForShutdownAsync();
+}
+finally
+{
+    try
+    {
+        await app.DisposeAsync();
+    }
+    finally
+    {
+        Log.CloseAndFlush();
+    }
+}
+
+internal static class LegacyDatabaseMigrationBaseline
+{
+    internal static IReadOnlyList<string> Apply(
+        DbConnection connection,
+        IReadOnlyList<string> migrations)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(migrations);
+
+        if (migrations.Count == 0)
+            throw new InvalidOperationException("没有可用于识别旧数据库结构的 EF 迁移。");
+
+        var actualSchema = SqliteSchemaSnapshot.Capture(connection);
+        var matchedMigrationCount = DetectMatchingMigrationCount(actualSchema, migrations, out var latestSchema);
+        if (matchedMigrationCount <= 0)
+        {
+            throw new InvalidOperationException(
+                "现有数据库没有 __EFMigrationsHistory，且结构无法与任何已知迁移版本可靠匹配。"
+                + "为避免重复建表或跳过必要迁移，已停止启动；请先备份并人工确认数据库版本。"
+                + $"结构差异：{actualSchema.DescribeDifference(latestSchema)}");
+        }
+
+        var appliedMigrations = migrations.Take(matchedMigrationCount).ToArray();
+        WriteHistory(connection, appliedMigrations);
+        return appliedMigrations;
+    }
+
+    private static int DetectMatchingMigrationCount(
+        SqliteSchemaSnapshot actualSchema,
+        IReadOnlyList<string> migrations,
+        out SqliteSchemaSnapshot latestSchema)
+    {
+        using var referenceConnection = new SqliteConnection("Data Source=:memory:");
+        referenceConnection.Open();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(referenceConnection)
+            .Options;
+        using var referenceDb = new AppDbContext(options);
+        var migrator = referenceDb.GetService<IMigrator>();
+
+        var matchedMigrationCount = 0;
+        latestSchema = SqliteSchemaSnapshot.Empty;
+        for (var i = 0; i < migrations.Count; i++)
+        {
+            migrator.Migrate(migrations[i]);
+            latestSchema = SqliteSchemaSnapshot.Capture(referenceConnection);
+            if (actualSchema.Equals(latestSchema))
+                matchedMigrationCount = i + 1;
+        }
+
+        return matchedMigrationCount;
+    }
+
+    private static void WriteHistory(DbConnection connection, IReadOnlyList<string> migrations)
+    {
+        var productVersion = typeof(DbContext)
+            .Assembly
+            .GetName()
+            .Version?
+            .ToString(3) ?? "8.0.0";
+
+        using var transaction = connection.BeginTransaction();
+        using (var create = connection.CreateCommand())
+        {
+            create.Transaction = transaction;
+            create.CommandText = """
+                CREATE TABLE __EFMigrationsHistory (
+                    MigrationId TEXT NOT NULL CONSTRAINT PK___EFMigrationsHistory PRIMARY KEY,
+                    ProductVersion TEXT NOT NULL
+                );
+                """;
+            create.ExecuteNonQuery();
+        }
+
+        foreach (var migration in migrations)
+        {
+            using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO __EFMigrationsHistory (MigrationId, ProductVersion)
+                VALUES ($id, $version);
+                """;
+
+            var idParameter = insert.CreateParameter();
+            idParameter.ParameterName = "$id";
+            idParameter.Value = migration;
+            insert.Parameters.Add(idParameter);
+
+            var versionParameter = insert.CreateParameter();
+            versionParameter.ParameterName = "$version";
+            versionParameter.Value = productVersion;
+            insert.Parameters.Add(versionParameter);
+
+            insert.ExecuteNonQuery();
+        }
+
+        transaction.Commit();
+    }
+
+    private sealed class SqliteSchemaSnapshot : IEquatable<SqliteSchemaSnapshot>
+    {
+        private readonly IReadOnlySet<string> entries;
+        private readonly string fingerprint;
+
+        internal static SqliteSchemaSnapshot Empty { get; } = new(Array.Empty<string>());
+
+        private SqliteSchemaSnapshot(IEnumerable<string> entries)
+        {
+            this.entries = entries.ToHashSet(StringComparer.Ordinal);
+            fingerprint = string.Join('\n', this.entries.Order(StringComparer.Ordinal));
+        }
+
+        internal static SqliteSchemaSnapshot Capture(DbConnection connection)
+        {
+            var entries = new List<string>();
+            var tables = ReadTableNames(connection);
+
+            foreach (var table in tables)
+            {
+                entries.Add($"table|{table}");
+                CaptureColumns(connection, table, entries);
+                CaptureIndexes(connection, table, entries);
+                CaptureForeignKeys(connection, table, entries);
+            }
+
+            return new SqliteSchemaSnapshot(entries);
+        }
+
+        public bool Equals(SqliteSchemaSnapshot? other)
+        {
+            return other != null
+                && string.Equals(fingerprint, other.fingerprint, StringComparison.Ordinal);
+        }
+
+        public override bool Equals(object? obj) => Equals(obj as SqliteSchemaSnapshot);
+
+        public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(fingerprint);
+
+        internal string DescribeDifference(SqliteSchemaSnapshot expected)
+        {
+            var missing = expected.entries.Except(entries, StringComparer.Ordinal).Take(5).ToArray();
+            var extra = entries.Except(expected.entries, StringComparer.Ordinal).Take(5).ToArray();
+            return $"缺少 [{string.Join("；", missing)}]；额外 [{string.Join("；", extra)}]";
+        }
+
+        private static IReadOnlyList<string> ReadTableNames(DbConnection connection)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name <> '__EFMigrationsHistory'
+                  AND name NOT LIKE 'sqlite_%'
+                ORDER BY name COLLATE BINARY;
+                """;
+
+            using var reader = command.ExecuteReader();
+            var tables = new List<string>();
+            while (reader.Read())
+                tables.Add(reader.GetString(0));
+            return tables;
+        }
+
+        private static void CaptureColumns(DbConnection connection, string table, ICollection<string> entries)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = $"PRAGMA table_xinfo({ToSqliteLiteral(table)});";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var name = reader.GetString(1);
+                var type = reader.IsDBNull(2) ? string.Empty : reader.GetString(2).Trim().ToUpperInvariant();
+                var notNull = reader.GetInt32(3);
+                var primaryKeyOrder = reader.GetInt32(5);
+                var hidden = reader.FieldCount > 6 ? reader.GetInt32(6) : 0;
+                // EnsureCreated 与 AddColumn 对同一最终列可能生成不同的数据库默认值；
+                // 默认值差异不代表该列可以安全地再次执行 AddColumn。
+                entries.Add($"column|{table}|{name}|{type}|{notNull}|{primaryKeyOrder}|{hidden}");
+            }
+        }
+
+        private static void CaptureIndexes(DbConnection connection, string table, ICollection<string> entries)
+        {
+            var indexes = new List<(string Name, int Unique, string Origin, int Partial)>();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = $"PRAGMA index_list({ToSqliteLiteral(table)});";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var name = reader.GetString(1);
+                    if (name.StartsWith("sqlite_autoindex_", StringComparison.Ordinal))
+                        continue;
+
+                    indexes.Add((
+                        name,
+                        reader.GetInt32(2),
+                        reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                        reader.FieldCount > 4 ? reader.GetInt32(4) : 0));
+                }
+            }
+
+            foreach (var index in indexes.OrderBy(item => item.Name, StringComparer.Ordinal))
+            {
+                var columns = new List<string>();
+                using var command = connection.CreateCommand();
+                command.CommandText = $"PRAGMA index_info({ToSqliteLiteral(index.Name)});";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                    columns.Add(reader.IsDBNull(2) ? $"#{reader.GetInt32(1)}" : reader.GetString(2));
+
+                entries.Add(
+                    $"index|{table}|{index.Name}|{index.Unique}|{index.Origin}|{index.Partial}|{string.Join(',', columns)}");
+            }
+        }
+
+        private static void CaptureForeignKeys(DbConnection connection, string table, ICollection<string> entries)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = $"PRAGMA foreign_key_list({ToSqliteLiteral(table)});";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                entries.Add(
+                    $"foreign-key|{table}|{reader.GetString(2)}|{reader.GetString(3)}|{reader.GetString(4)}|"
+                    + $"{reader.GetString(5)}|{reader.GetString(6)}|{reader.GetString(7)}");
+            }
+        }
+
+        private static string ToSqliteLiteral(string value) => $"'{value.Replace("'", "''")}'";
+    }
+}

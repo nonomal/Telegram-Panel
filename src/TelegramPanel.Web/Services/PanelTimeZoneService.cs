@@ -24,37 +24,69 @@ public sealed class PanelTimeZoneService
         }
     }
 
+    public TimeZoneInfo ApplyTimeZoneId(string? timeZoneId)
+    {
+        var tz = Resolve((timeZoneId ?? string.Empty).Trim());
+        lock (_gate)
+        {
+            _timeZone = tz;
+        }
+
+        return tz;
+    }
+
     public string Format(DateTime? valueUtcOrUnspecified, string format = "yyyy-MM-dd HH:mm", string emptyText = "-")
     {
         if (valueUtcOrUnspecified == null)
             return emptyText;
 
-        var converted = ConvertFromUtcOrUnspecified(valueUtcOrUnspecified.Value);
-        return converted.ToString(format);
+        try
+        {
+            var converted = ConvertFromUtcOrUnspecified(valueUtcOrUnspecified.Value);
+            return converted.ToString(format);
+        }
+        catch
+        {
+            // 数据库里的历史/异常时间值不应导致整个 Blazor 电路中断。
+            return emptyText;
+        }
     }
 
     public DateTime ConvertFromUtcOrUnspecified(DateTime valueUtcOrUnspecified)
     {
-        var utc = valueUtcOrUnspecified.Kind switch
+        DateTime utc;
+        try
         {
-            DateTimeKind.Utc => valueUtcOrUnspecified,
-            DateTimeKind.Local => valueUtcOrUnspecified.ToUniversalTime(),
-            _ => DateTime.SpecifyKind(valueUtcOrUnspecified, DateTimeKind.Utc)
-        };
+            utc = valueUtcOrUnspecified.Kind switch
+            {
+                DateTimeKind.Utc => valueUtcOrUnspecified,
+                DateTimeKind.Local => valueUtcOrUnspecified.ToUniversalTime(),
+                _ => DateTime.SpecifyKind(valueUtcOrUnspecified, DateTimeKind.Utc)
+            };
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return valueUtcOrUnspecified;
+        }
 
         var tz = Current;
-        return TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
+        try
+        {
+            return TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return utc;
+        }
+        catch (ArgumentException)
+        {
+            return utc;
+        }
     }
 
     private void Apply(PanelTimeZoneOptions options)
     {
-        var id = (options.TimeZoneId ?? string.Empty).Trim();
-
-        var tz = Resolve(id);
-        lock (_gate)
-        {
-            _timeZone = tz;
-        }
+        ApplyTimeZoneId(options.TimeZoneId);
     }
 
     private static TimeZoneInfo Resolve(string timeZoneId)
@@ -97,4 +129,3 @@ public sealed class PanelTimeZoneService
         }
     }
 }
-

@@ -1,10 +1,11 @@
 services:
   telegram-panel:
-    build:
-      context: .
-      dockerfile: ${TP_DOCKERFILE:-Dockerfile}
+    image: ${TP_IMAGE:-ghcr.io/moeacgx/telegram-panel:latest}
+    pull_policy: always
     container_name: telegram-panel
     restart: unless-stopped
+    # 使用轻量 init 回收健康检查等外部子进程，避免长期运行积累僵尸进程。
+    init: true
     ports:
       - "5000:5000"
     volumes:
@@ -12,6 +13,9 @@ services:
     environment:
       ASPNETCORE_URLS: "http://+:5000"
       DOTNET_ENVIRONMENT: "Production"
+      # auto：按版本自动选择；image：只运行镜像；binary：优先运行 /data/app-current。
+      SelfUpdate__Mode: "${TP_UPDATE_MODE:-auto}"
+      TELEGRAM_PANEL_UPDATE_MODE: "${TP_UPDATE_MODE:-auto}"
 
       # SQLite 数据库（持久化到 ./docker-data）
       ConnectionStrings__DefaultConnection: "Data Source=/data/telegram-panel.db"
@@ -22,11 +26,16 @@ services:
       # 后台登录凭据文件（持久化到 ./docker-data/admin_auth.json）
       AdminAuth__CredentialsPath: "/data/admin_auth.json"
 
-      # 默认关闭，避免频繁调用 Telegram API；可在系统设置里开启并保存到 /data/appsettings.local.json
-      Sync__AutoSyncEnabled: "false"
+      # 普通代理和 Resin 使用轻量 ProbeUrl 做健康巡检；手动检测才调用 MetadataUrl 获取出口元数据。
+      Proxy__Egress__ProbeUrl: "${TP_PROXY_EGRESS_PROBE_URL:-https://208.67.222.222/}"
+      Proxy__Egress__MetadataUrl: "${TP_PROXY_EGRESS_METADATA_URL:-https://cloudflare.com/cdn-cgi/trace}"
+      Proxy__Egress__Maintenance__Enabled: "${TP_PROXY_EGRESS_MAINTENANCE_ENABLED:-true}"
+      Proxy__Egress__Maintenance__InitialDelaySeconds: "${TP_PROXY_EGRESS_MAINTENANCE_INITIAL_DELAY_SECONDS:-30}"
+      Proxy__Egress__Maintenance__IntervalMinutes: "${TP_PROXY_EGRESS_MAINTENANCE_INTERVAL_MINUTES:-5}"
 
-      # 默认关闭 bot 轮询自动同步（需要时可手动同步），使用Webhook建议开启
-      Telegram__BotAutoSyncEnabled: "true"
+      # 说明：这些“易变开关”建议通过面板「系统设置」保存到 /data/appsettings.local.json 来配置，
+      # 不要直接改 docker-compose.yml（否则 git pull 更新时容易冲突）。
+      # 注意：如果在这里设置了对应环境变量，会覆盖 /data/appsettings.local.json 的面板配置。
 
       # ========== Webhook 模式配置 ==========
       # 启用 Webhook 模式（启用后将使用 Webhook 替代轮询接收更新）
@@ -35,3 +44,17 @@ services:
       Telegram__WebhookBaseUrl: "${TP_TELEGRAM_WEBHOOK_BASE_URL:-}"
       # Webhook 验证密钥（用于验证 Telegram 请求，建议使用随机字符串）
       Telegram__WebhookSecretToken: "${TP_TELEGRAM_WEBHOOK_SECRET_TOKEN:-}"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:5000/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+
+    # Docker 自身的 stdout/stderr 日志滚动，避免日志无限增长占满磁盘。
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

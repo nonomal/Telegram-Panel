@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
+using TelegramPanel.Core.Models;
 using TL;
 using WTelegram;
 
@@ -19,12 +20,20 @@ public static class SessionDataConverter
         public static SessionConvertResult Fail(string? reason) => new(false, string.IsNullOrWhiteSpace(reason) ? "未知原因" : reason.Trim());
     }
 
+    public readonly record struct TelethonStringSessionResult(bool Ok, string? SessionString, string? Reason)
+    {
+        public static TelethonStringSessionResult Success(string sessionString) => new(true, sessionString, null);
+        public static TelethonStringSessionResult Fail(string? reason) => new(false, null, string.IsNullOrWhiteSpace(reason) ? "未知原因" : reason.Trim());
+    }
+
     public static async Task<SessionConvertResult> TryConvertSqliteSessionFromJsonAsync(
         string phone,
         int apiId,
         string apiHash,
         string sqliteSessionPath,
-        ILogger logger)
+        ILogger logger,
+        ProxyConnectionOptions? proxy = null,
+        CancellationToken cancellationToken = default)
     {
         try
         {
@@ -35,7 +44,7 @@ public static class SessionDataConverter
             var jsonPath = TryFindAnySessionJsonPath(phone, absoluteSqliteSessionPath);
             if (!string.IsNullOrWhiteSpace(jsonPath) && File.Exists(jsonPath))
             {
-                var jsonText = await File.ReadAllTextAsync(jsonPath);
+                var jsonText = await File.ReadAllTextAsync(jsonPath, cancellationToken);
                 using var doc = JsonDocument.Parse(jsonText);
 
                 JsonElement sessionProp;
@@ -61,7 +70,9 @@ public static class SessionDataConverter
                             targetSessionPath: absoluteSqliteSessionPath,
                             phone: phone,
                             userId: userId,
-                            logger: logger);
+                            logger: logger,
+                            proxy: proxy,
+                            cancellationToken: cancellationToken);
 
                         if (converted.Ok)
                         {
@@ -82,7 +93,9 @@ public static class SessionDataConverter
                 targetSessionPath: absoluteSqliteSessionPath,
                 phone: phone,
                 userId: null,
-                logger: logger);
+                logger: logger,
+                proxy: proxy,
+                cancellationToken: cancellationToken);
 
             if (sqliteConverted.Ok)
                 logger.LogInformation("Converted sqlite session for {Phone} using sqlite content", phone);
@@ -105,9 +118,10 @@ public static class SessionDataConverter
         string targetSessionPath,
         string phone,
         long? userId,
-        ILogger logger)
+        ILogger logger,
+        ProxyConnectionOptions? proxy = null,
+        CancellationToken cancellationToken = default)
     {
-        string? backupPath = null;
         try
         {
             if (string.IsNullOrWhiteSpace(sessionString))
@@ -123,46 +137,35 @@ public static class SessionDataConverter
             if (!TryParseTelethonStringSession(sessionString.Trim(), out var telethon))
                 return SessionConvertResult.Fail("session_string 无法解析为 Telethon StringSession（可能格式不兼容或已损坏）");
 
-            // 先备份旧 sqlite session，再生成 WTelegram session 覆盖原路径
-            if (File.Exists(absoluteTargetSessionPath))
-            {
-                var suffix = LooksLikeSqliteSession(absoluteTargetSessionPath) ? "sqlite.bak" : "bak";
-                backupPath = BuildBackupPath(absoluteTargetSessionPath, suffix);
-                Directory.CreateDirectory(Path.GetDirectoryName(backupPath) ?? Directory.GetCurrentDirectory());
-                File.Move(absoluteTargetSessionPath, backupPath, overwrite: true);
-            }
-
             var sessionsDir = Path.GetDirectoryName(absoluteTargetSessionPath) ?? Directory.GetCurrentDirectory();
             Directory.CreateDirectory(sessionsDir);
+            using var replacement = AtomicSessionFileReplacement.Create(absoluteTargetSessionPath);
 
-            // 使用 WTelegram 的 Session 存储格式生成可用 session 文件（加密 JSON）
+            // 先在同目录候选文件中完成写入和联网验证，旧目标在验证成功前保持不变。
             var written = await WriteWTelegramSessionFileAsync(
                 apiId: apiId,
                 apiHash: apiHash,
-                sessionPath: absoluteTargetSessionPath,
+                sessionPath: replacement.StagingPath,
                 phoneDigits: normalizedPhone,
                 userId: userId,
                 dcId: telethon.DcId,
                 ipAddress: telethon.IpAddress,
                 port: telethon.Port,
                 authKey: telethon.AuthKey,
-                logger: logger
+                logger: logger,
+                proxy: proxy,
+                cancellationToken: cancellationToken
             );
             if (!written.Ok)
                 return written;
 
+            replacement.Apply();
+            replacement.Commit();
             return SessionConvertResult.Success();
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to create WTelegram session from session_string");
-            try { if (File.Exists(targetSessionPath)) File.Delete(targetSessionPath); } catch { }
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(backupPath) && File.Exists(backupPath) && !File.Exists(targetSessionPath))
-                    File.Move(backupPath, targetSessionPath, overwrite: true);
-            }
-            catch { }
             return SessionConvertResult.Fail($"{ex.GetType().Name}: {ex.Message}");
         }
     }
@@ -191,9 +194,10 @@ public static class SessionDataConverter
         string targetSessionPath,
         string phone,
         long? userId,
-        ILogger logger)
+        ILogger logger,
+        ProxyConnectionOptions? proxy = null,
+        CancellationToken cancellationToken = default)
     {
-        string? backupPath = null;
         try
         {
             var absoluteSqlitePath = Path.GetFullPath(sqliteSessionPath);
@@ -211,42 +215,33 @@ public static class SessionDataConverter
             if (string.IsNullOrWhiteSpace(normalizedPhone))
                 return SessionConvertResult.Fail("无法从手机号/文件名解析出 phoneDigits");
 
-            if (File.Exists(absoluteTarget))
-            {
-                var suffix = LooksLikeSqliteSession(absoluteTarget) ? "sqlite.bak" : "bak";
-                backupPath = BuildBackupPath(absoluteTarget, suffix);
-                Directory.CreateDirectory(Path.GetDirectoryName(backupPath) ?? Directory.GetCurrentDirectory());
-                File.Move(absoluteTarget, backupPath, overwrite: true);
-            }
+            using var replacement = AtomicSessionFileReplacement.Create(absoluteTarget);
 
             var written = await WriteWTelegramSessionFileAsync(
                 apiId: apiId,
                 apiHash: apiHash,
-                sessionPath: absoluteTarget,
+                sessionPath: replacement.StagingPath,
                 phoneDigits: normalizedPhone ?? string.Empty,
                 userId: userId,
                 dcId: telethon.DcId,
                 ipAddress: telethon.IpAddress,
                 port: telethon.Port,
                 authKey: telethon.AuthKey,
-                logger: logger
+                logger: logger,
+                proxy: proxy,
+                cancellationToken: cancellationToken
             );
 
             if (!written.Ok)
                 return written;
 
+            replacement.Apply();
+            replacement.Commit();
             return SessionConvertResult.Success();
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to create WTelegram session from telethon sqlite session");
-            try { if (File.Exists(targetSessionPath)) File.Delete(targetSessionPath); } catch { }
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(backupPath) && File.Exists(backupPath) && !File.Exists(targetSessionPath))
-                    File.Move(backupPath, targetSessionPath, overwrite: true);
-            }
-            catch { }
             return SessionConvertResult.Fail($"{ex.GetType().Name}: {ex.Message}");
         }
     }
@@ -260,7 +255,9 @@ public static class SessionDataConverter
             using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
             {
                 DataSource = sqliteSessionPath,
-                Mode = SqliteOpenMode.ReadOnly
+                Mode = SqliteOpenMode.ReadOnly,
+                Cache = SqliteCacheMode.Private,
+                Pooling = false
             }.ToString());
             connection.Open();
 
@@ -290,7 +287,7 @@ public static class SessionDataConverter
                 return false;
             }
 
-            if (port <= 0)
+            if (port is < 1 or > ushort.MaxValue)
             {
                 reason = $"port 无效：{port}";
                 return false;
@@ -395,6 +392,14 @@ public static class SessionDataConverter
         }
     }
 
+    private static string Base64UrlEncode(byte[] bytes)
+    {
+        var base64 = Convert.ToBase64String(bytes);
+        // 注意：@mtcute/convert 在 Telethon->tdata 转换时，要求保留 base64 padding（尾部 '='）。
+        // 若去掉 padding，可能会把 auth key 解析成 248 字节，导致导出的 tdata 无法被官方客户端使用。
+        return base64.Replace('+', '-').Replace('/', '_');
+    }
+
     private readonly record struct TelethonSessionData(int DcId, string IpAddress, ushort Port, byte[] AuthKey);
 
     private static bool TryParseTelethonStringSession(string sessionString, out TelethonSessionData data)
@@ -438,6 +443,186 @@ public static class SessionDataConverter
         }
     }
 
+    public static TelethonStringSessionResult TryCreateTelethonStringSessionFromWTelegramSessionFile(
+        string sessionPath,
+        int apiId,
+        string apiHash,
+        string? phone,
+        long? userId,
+        ILogger logger)
+    {
+        try
+        {
+            var absoluteSessionPath = Path.GetFullPath(sessionPath);
+            if (!File.Exists(absoluteSessionPath))
+                return TelethonStringSessionResult.Fail($"session 文件不存在：{absoluteSessionPath}");
+
+            var deviceProfile = TelegramClientDeviceProfile.ForStableKey(apiId, $"{apiId}:{phone}:{absoluteSessionPath}");
+            string Config(string what) => what switch
+            {
+                "api_id" => apiId.ToString(),
+                "api_hash" => apiHash,
+                "session_key" => apiHash,
+                "session_pathname" => absoluteSessionPath,
+                "phone_number" => NormalizePhone(phone),
+                "user_id" => userId.HasValue && userId.Value > 0 ? userId.Value.ToString() : null!,
+                "app_id" => apiId.ToString(),
+                "app_hash" => apiHash,
+                "app_version" or "device_model" or "system_version" or "system_lang_code" or "lang_code" => deviceProfile.GetConfigValue(what)!,
+
+                _ => null!
+            };
+
+            using var client = new Client(Config);
+            var clientType = typeof(Client);
+            var currentDcSessionField = clientType.GetField("_dcSession", BindingFlags.Instance | BindingFlags.NonPublic);
+            var sessionField = clientType.GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("无法访问 WTelegram.Client._session");
+            var sessionObj = sessionField.GetValue(client) ?? throw new InvalidOperationException("WTelegram session 未初始化");
+            var sessionType = sessionObj.GetType();
+
+            var mainDc = (int?)sessionType.GetField("MainDC")?.GetValue(sessionObj) ?? 0;
+            var dcSessionsField = sessionType.GetField("DCSessions");
+            var dcSessions = dcSessionsField?.GetValue(sessionObj) as System.Collections.IDictionary;
+            if (dcSessions == null || dcSessions.Count == 0)
+                return TelethonStringSessionResult.Fail("session 中未找到任何 DC 会话数据");
+
+            var candidateSessions = new List<(object DcSessionObj, bool IsCurrentDc)>();
+            var currentDcSessionObj = currentDcSessionField?.GetValue(client);
+            if (currentDcSessionObj != null)
+                candidateSessions.Add((currentDcSessionObj, true));
+
+            if (mainDc > 0 && dcSessions.Contains(mainDc) && dcSessions[mainDc] != null)
+                candidateSessions.Add((dcSessions[mainDc]!, false));
+
+            foreach (System.Collections.DictionaryEntry entry in dcSessions)
+            {
+                if (entry.Value != null)
+                    candidateSessions.Add((entry.Value, false));
+            }
+
+            byte[]? authKey = null;
+            DcOption? dataCenterObj = null;
+            long pickedDcUserId = 0;
+            var bestScore = int.MinValue;
+
+            foreach (var (dcSessionObj, isCurrentDc) in candidateSessions)
+            {
+                if (!TryExtractDcSessionInfo(dcSessionObj, out var candidateAuthKey, out var candidateDataCenter, out var dcUserId))
+                    continue;
+                if (candidateAuthKey == null || candidateAuthKey.Length != 256)
+                    continue;
+                if (candidateDataCenter == null)
+                    continue;
+
+                var score = 0;
+                if (isCurrentDc)
+                    score += 100;
+                if (dcUserId > 0)
+                    score += 50;
+                if (userId.HasValue && userId.Value > 0 && dcUserId == userId.Value)
+                    score += 40;
+                if (mainDc > 0 && candidateDataCenter.id == mainDc)
+                    score += 20;
+
+                if (score <= bestScore)
+                    continue;
+
+                bestScore = score;
+                authKey = candidateAuthKey;
+                dataCenterObj = candidateDataCenter;
+                pickedDcUserId = dcUserId;
+            }
+
+            if (authKey == null || authKey.Length != 256 || dataCenterObj == null)
+                return TelethonStringSessionResult.Fail("无法从 session 中解析有效的已授权 DCSession（AuthKey/DataCenter）");
+
+            if (dataCenterObj.id <= 0 || dataCenterObj.id > byte.MaxValue)
+                return TelethonStringSessionResult.Fail($"DataCenter ID 无效：{dataCenterObj.id}");
+
+            if (string.IsNullOrWhiteSpace(dataCenterObj.ip_address))
+                return TelethonStringSessionResult.Fail("DataCenter IP 为空");
+
+            if (dataCenterObj.port <= 0 || dataCenterObj.port > ushort.MaxValue)
+                return TelethonStringSessionResult.Fail($"DataCenter 端口无效：{dataCenterObj.port}");
+
+            if (!IPAddress.TryParse(dataCenterObj.ip_address.Trim(), out var ip))
+                return TelethonStringSessionResult.Fail($"DataCenter IP 无法解析：{dataCenterObj.ip_address}");
+
+            var ipBytes = ip.GetAddressBytes();
+            if (ipBytes.Length is not (4 or 16))
+                return TelethonStringSessionResult.Fail($"DataCenter IP 字节长度无效：{ipBytes.Length}");
+
+            var packed = new byte[1 + ipBytes.Length + 2 + 256];
+            packed[0] = (byte)dataCenterObj.id;
+            Buffer.BlockCopy(ipBytes, 0, packed, 1, ipBytes.Length);
+            BinaryPrimitives.WriteUInt16BigEndian(packed.AsSpan(1 + ipBytes.Length, 2), (ushort)dataCenterObj.port);
+            Buffer.BlockCopy(authKey, 0, packed, 1 + ipBytes.Length + 2, 256);
+
+            var sessionString = "1" + Base64UrlEncode(packed);
+            logger.LogInformation(
+                "Picked DCSession for Telethon export: mainDc={MainDc}, dcId={DcId}, dcUserId={DcUserId}, targetUserId={TargetUserId}, isIpV6={IsIpV6}",
+                mainDc,
+                dataCenterObj.id,
+                pickedDcUserId,
+                userId,
+                ipBytes.Length == 16);
+            return TelethonStringSessionResult.Success(sessionString);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to create telethon string session from WTelegram session file: {SessionPath}", sessionPath);
+            return TelethonStringSessionResult.Fail($"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static bool TryExtractDcSessionInfo(
+        object dcSessionObj,
+        out byte[]? authKey,
+        out DcOption? dataCenter,
+        out long dcUserId)
+    {
+        try
+        {
+            var dcSessionType = dcSessionObj.GetType();
+            authKey = dcSessionType.GetField("AuthKey")?.GetValue(dcSessionObj) as byte[];
+            dataCenter = dcSessionType.GetField("DataCenter")?.GetValue(dcSessionObj) as DcOption;
+
+            dcUserId = 0;
+            var userIdObj = dcSessionType.GetField("UserId")?.GetValue(dcSessionObj);
+            switch (userIdObj)
+            {
+                case int i:
+                    dcUserId = i;
+                    break;
+                case long l:
+                    dcUserId = l;
+                    break;
+                case uint ui:
+                    dcUserId = ui;
+                    break;
+                case ulong ul:
+                    dcUserId = (long)Math.Min(ul, long.MaxValue);
+                    break;
+                case short s:
+                    dcUserId = s;
+                    break;
+                case ushort us:
+                    dcUserId = us;
+                    break;
+            }
+
+            return authKey != null && dataCenter != null;
+        }
+        catch
+        {
+            authKey = null;
+            dataCenter = null;
+            dcUserId = 0;
+            return false;
+        }
+    }
+
     private static async Task<SessionConvertResult> WriteWTelegramSessionFileAsync(
         int apiId,
         string apiHash,
@@ -448,8 +633,11 @@ public static class SessionDataConverter
         string ipAddress,
         ushort port,
         byte[] authKey,
-        ILogger logger)
+        ILogger logger,
+        ProxyConnectionOptions? proxy = null,
+        CancellationToken cancellationToken = default)
     {
+        var deviceProfile = TelegramClientDeviceProfile.ForStableKey(apiId, $"{apiId}:{phoneDigits}:{sessionPath}");
         string Config(string what) => what switch
         {
             "api_id" => apiId.ToString(),
@@ -458,6 +646,9 @@ public static class SessionDataConverter
             "session_pathname" => sessionPath,
             "phone_number" => phoneDigits,
             "user_id" => userId?.ToString() ?? "-1",
+            "app_id" => apiId.ToString(),
+            "app_hash" => apiHash,
+            "app_version" or "device_model" or "system_version" or "system_lang_code" or "lang_code" => deviceProfile.GetConfigValue(what)!,
             _ => null!
         };
 
@@ -525,6 +716,8 @@ public static class SessionDataConverter
         await using var probe = new Client(Config);
         try
         {
+            TelegramImportProxyConfigurator.Apply(probe, proxy, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             await probe.ConnectAsync();
             var users = await probe.Users_GetUsers(InputUser.Self);
             var self = users.OfType<User>().FirstOrDefault();
@@ -562,15 +755,6 @@ public static class SessionDataConverter
             logger.LogWarning(ex, "WTelegram session validation failed for {Phone}", phoneDigits);
             return SessionConvertResult.Fail($"验证失败：{ex.GetType().Name}: {ex.Message}");
         }
-    }
-
-    private static string BuildBackupPath(string originalPath, string suffix)
-    {
-        var fullPath = Path.GetFullPath(originalPath);
-        var dir = Path.GetDirectoryName(fullPath) ?? Directory.GetCurrentDirectory();
-        var name = Path.GetFileNameWithoutExtension(fullPath);
-        var ext = Path.GetExtension(fullPath);
-        return Path.Combine(dir, $"{name}.{suffix}{ext}");
     }
 
     private static string? TryFindRepoRoot()
@@ -634,5 +818,4 @@ public static class SessionDataConverter
         return digits.ToString();
     }
 
-    // 备份逻辑在 TryCreateWTelegramSessionFromSessionStringAsync 内集中处理
 }

@@ -21,11 +21,18 @@ public static class ServiceCollectionExtensions
 
         // 注册所有Repository
         services.AddScoped<IAccountRepository, AccountRepository>();
+        services.AddScoped<IOutboundProxyRepository, OutboundProxyRepository>();
+        services.AddScoped<IWarpProfileRepository, WarpProfileRepository>();
         services.AddScoped<IAccountCategoryRepository, AccountCategoryRepository>();
         services.AddScoped<IAccountChannelRepository, AccountChannelRepository>();
+        services.AddScoped<IAccountGroupRepository, AccountGroupRepository>();
         services.AddScoped<IChannelRepository, ChannelRepository>();
         services.AddScoped<IChannelGroupRepository, ChannelGroupRepository>();
         services.AddScoped<IGroupRepository, GroupRepository>();
+        services.AddScoped<IGroupCategoryRepository, GroupCategoryRepository>();
+        services.AddScoped<IDataDictionaryRepository, DataDictionaryRepository>();
+        services.AddScoped<IDataDictionaryItemRepository, DataDictionaryItemRepository>();
+        services.AddScoped<IScheduledTaskRepository, ScheduledTaskRepository>();
         services.AddScoped<IBatchTaskRepository, BatchTaskRepository>();
         services.AddScoped<IBotRepository, BotRepository>();
         services.AddScoped<IBotChannelRepository, BotChannelRepository>();

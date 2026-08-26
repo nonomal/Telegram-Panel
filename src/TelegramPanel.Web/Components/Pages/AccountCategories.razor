@@ -48,10 +48,10 @@
                     </HeaderContent>
                     <RowTemplate>
                         <MudTd DataLabel="分类名称">
-                            <MudChip T="string" Style="@($"background-color: {context.Color ?? "#9E9E9E"}")">@context.Name</MudChip>
+                            <MudChip T="string" Style="@($"color: {context.Color ?? "#9E9E9E"}; border: 1px solid {context.Color ?? "#9E9E9E"}; background-color: transparent;")">@context.Name</MudChip>
                         </MudTd>
                         <MudTd DataLabel="颜色">
-                            <div style="@($"width: 30px; height: 30px; background-color: {context.Color ?? "#9E9E9E"}; border-radius: 4px;")"></div>
+                            <div style="@($"width: 30px; height: 30px; color: {context.Color ?? "#9E9E9E"}; border: 1px solid {context.Color ?? "#9E9E9E"}; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; background-color: transparent;")">A</div>
                         </MudTd>
                         <MudTd DataLabel="描述">@(context.Description ?? "-")</MudTd>
                         <MudTd DataLabel="排除操作">

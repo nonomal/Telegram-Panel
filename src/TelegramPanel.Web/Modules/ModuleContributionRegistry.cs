@@ -5,7 +5,10 @@ namespace TelegramPanel.Web.Modules;
 
 public sealed class ModuleContributionRegistry
 {
-    public ModuleContributionRegistry(ModuleRegistry registry, ILogger<ModuleContributionRegistry> logger)
+    public ModuleContributionRegistry(
+        ModuleRegistry registry,
+        ILogger<ModuleContributionRegistry> logger,
+        IServiceProvider? serviceProvider = null)
     {
         var tasks = new List<RegisteredTaskDefinition>();
         var apis = new List<RegisteredApiTypeDefinition>();
@@ -19,7 +22,8 @@ public sealed class ModuleContributionRegistry
             {
                 foreach (var t in taskProvider.GetTasks(m.Context) ?? Array.Empty<ModuleTaskDefinition>())
                 {
-                    tasks.Add(new RegisteredTaskDefinition(m, NormalizeTask(t)));
+                    var normalized = NormalizeTask(t);
+                    tasks.Add(new RegisteredTaskDefinition(m, normalized));
                 }
             }
 
@@ -44,18 +48,29 @@ public sealed class ModuleContributionRegistry
             }
         }
 
-        Tasks = tasks;
+        var taskIndex = BuildTaskIndex(tasks, diagnostics, logger, out var conflictedTaskTypes);
+        Tasks = tasks.Select(task => task with
+        {
+            CanCreate = !conflictedTaskTypes.Contains(task.Definition.TaskType)
+                && CanCreateTask(task, serviceProvider, diagnostics, logger)
+        }).ToList();
+        CreatableTasks = Tasks.Where(x => x.CanCreate).ToList();
         ApiTypes = apis;
         Pages = pages;
         NavItems = navs;
 
-        TaskTypeToDefinition = BuildTaskIndex(tasks, diagnostics, logger);
+        TaskTypeToDefinition = taskIndex.Keys.ToDictionary(
+            key => key,
+            key => Tasks.First(task =>
+                string.Equals(task.Definition.TaskType, key, StringComparison.OrdinalIgnoreCase)),
+            StringComparer.OrdinalIgnoreCase);
         ApiTypeToDefinition = BuildApiIndex(apis, diagnostics, logger);
         PageKeyToDefinition = BuildPageIndex(pages, diagnostics, logger);
         Diagnostics = diagnostics;
     }
 
     public IReadOnlyList<RegisteredTaskDefinition> Tasks { get; }
+    public IReadOnlyList<RegisteredTaskDefinition> CreatableTasks { get; }
     public IReadOnlyList<RegisteredApiTypeDefinition> ApiTypes { get; }
     public IReadOnlyList<RegisteredPageDefinition> Pages { get; }
     public IReadOnlyList<RegisteredNavItem> NavItems { get; }
@@ -69,26 +84,127 @@ public sealed class ModuleContributionRegistry
     private static IReadOnlyDictionary<string, RegisteredTaskDefinition> BuildTaskIndex(
         List<RegisteredTaskDefinition> list,
         List<string> diagnostics,
-        ILogger logger)
+        ILogger logger,
+        out HashSet<string> conflictedTaskTypes)
     {
         var dict = new Dictionary<string, RegisteredTaskDefinition>(StringComparer.OrdinalIgnoreCase);
+        conflictedTaskTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var t in list)
         {
             var key = (t.Definition.TaskType ?? "").Trim();
             if (key.Length == 0)
                 continue;
 
-            if (dict.ContainsKey(key))
+            if (dict.TryGetValue(key, out var existing))
             {
-                var msg = $"任务类型冲突：{key} 同时来自 {dict[key].Module.Id} 与 {t.Module.Id}，已忽略后者";
+                var msg = $"任务类型冲突：{key} 同时来自 {existing.Module.Id} 与 {t.Module.Id}，已禁用该类型";
                 diagnostics.Add(msg);
                 logger.LogWarning(msg);
+                conflictedTaskTypes.Add(key);
+                dict.Remove(key);
                 continue;
             }
 
-            dict[key] = t;
+            if (!conflictedTaskTypes.Contains(key))
+                dict[key] = t;
         }
         return dict;
+    }
+
+    private static bool CanCreateTask(
+        RegisteredTaskDefinition task,
+        IServiceProvider? serviceProvider,
+        List<string> diagnostics,
+        ILogger logger)
+    {
+        if (!ModuleTaskExecutionKinds.IsValid(task.Definition.ExecutionKind))
+        {
+            AddTaskDiagnostic(task, "ExecutionKind 无效", diagnostics, logger);
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(task.Definition.TaskType))
+            return false;
+
+        if (task.Module.BuiltIn)
+        {
+            return string.IsNullOrWhiteSpace(task.Definition.CreateRoute)
+                && TelegramPanel.Web.Services.ModuleTaskEditorComponentResolver.ResolveCreateEditor(task) != null;
+        }
+
+        if (!IsOwnedCreateRoute(task.Module.Id, task.Definition.CreateRoute))
+        {
+            AddTaskDiagnostic(task, "CreateRoute 必须位于模块自身的 /ext/{moduleId} 路径下", diagnostics, logger);
+            return false;
+        }
+
+        if (serviceProvider == null)
+            return false;
+
+        try
+        {
+            using var scope = serviceProvider.CreateScope();
+            var taskType = task.Definition.TaskType;
+            var handlerCount = string.Equals(
+                    task.Definition.ExecutionKind,
+                    ModuleTaskExecutionKinds.Persistent,
+                    StringComparison.OrdinalIgnoreCase)
+                ? scope.ServiceProvider.GetServices<IModulePersistentTaskHandler>()
+                    .Count(handler => string.Equals(handler.TaskType, taskType, StringComparison.OrdinalIgnoreCase))
+                : scope.ServiceProvider.GetServices<IModuleTaskHandler>()
+                    .Count(handler => string.Equals(handler.TaskType, taskType, StringComparison.OrdinalIgnoreCase));
+            var lifecycleCount = scope.ServiceProvider.GetServices<IModuleTaskLifecycleHandler>()
+                .Count(handler => string.Equals(handler.TaskType, taskType, StringComparison.OrdinalIgnoreCase));
+            if (handlerCount == 1 && lifecycleCount == 1)
+                return true;
+
+            AddTaskDiagnostic(
+                task,
+                $"需要唯一执行器和生命周期处理器（executor={handlerCount}, lifecycle={lifecycleCount}）",
+                diagnostics,
+                logger);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            AddTaskDiagnostic(task, $"执行器校验失败：{ex.Message}", diagnostics, logger);
+            return false;
+        }
+    }
+
+    private static bool IsOwnedCreateRoute(string moduleId, string? route)
+    {
+        if (string.IsNullOrWhiteSpace(route) || route.Contains('\\'))
+            return false;
+
+        var path = route.Split('?', '#')[0];
+        try
+        {
+            path = Uri.UnescapeDataString(path);
+        }
+        catch (UriFormatException)
+        {
+            return false;
+        }
+        if (path.Contains('\\'))
+            return false;
+        var prefix = $"/ext/{moduleId}";
+        if (!string.Equals(path, prefix, StringComparison.Ordinal)
+            && !path.StartsWith(prefix + "/", StringComparison.Ordinal))
+            return false;
+
+        return !path.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Any(segment => segment is "." or "..");
+    }
+
+    private static void AddTaskDiagnostic(
+        RegisteredTaskDefinition task,
+        string reason,
+        List<string> diagnostics,
+        ILogger logger)
+    {
+        var message = $"任务 {task.Module.Id}/{task.Definition.TaskType} 不可创建：{reason}";
+        diagnostics.Add(message);
+        logger.LogWarning(message);
     }
 
     private static IReadOnlyDictionary<string, RegisteredApiTypeDefinition> BuildApiIndex(
@@ -143,6 +259,7 @@ public sealed class ModuleContributionRegistry
     {
         t.Category = (t.Category ?? "").Trim();
         t.TaskType = (t.TaskType ?? "").Trim();
+        t.ExecutionKind = (t.ExecutionKind ?? "").Trim().ToLowerInvariant();
         t.DisplayName = (t.DisplayName ?? "").Trim();
         t.Description = (t.Description ?? "").Trim();
         t.Icon = (t.Icon ?? "").Trim();
@@ -150,6 +267,9 @@ public sealed class ModuleContributionRegistry
         if (string.IsNullOrWhiteSpace(t.CreateRoute)) t.CreateRoute = null;
         t.EditorComponentType = (t.EditorComponentType ?? "").Trim();
         if (string.IsNullOrWhiteSpace(t.EditorComponentType)) t.EditorComponentType = null;
+        t.TaskCenter ??= new ModuleTaskCenterCapabilities();
+        t.TaskCenter.EditComponentType = (t.TaskCenter.EditComponentType ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(t.TaskCenter.EditComponentType)) t.TaskCenter.EditComponentType = null;
         return t;
     }
 
@@ -184,7 +304,10 @@ public sealed class ModuleContributionRegistry
     }
 }
 
-public sealed record RegisteredTaskDefinition(LoadedModule Module, ModuleTaskDefinition Definition);
+public sealed record RegisteredTaskDefinition(LoadedModule Module, ModuleTaskDefinition Definition)
+{
+    public bool CanCreate { get; init; }
+}
 public sealed record RegisteredApiTypeDefinition(LoadedModule Module, ModuleApiTypeDefinition Definition);
 public sealed record RegisteredPageDefinition(LoadedModule Module, ModulePageDefinition Definition);
 public sealed record RegisteredNavItem(LoadedModule Module, ModuleNavItem Definition);

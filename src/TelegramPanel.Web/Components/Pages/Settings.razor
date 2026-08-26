@@ -7,12 +7,17 @@
 @inject IGroupService GroupService
 @inject ITelegramClientPool TelegramClientPool
 @inject TelegramPanel.Web.Services.DataSyncService DataSync
+@inject BatchTaskManagementService TaskManagement
 @inject ISnackbar Snackbar
 @inject IDialogService DialogService
-@inject IWebHostEnvironment Environment
+@inject IWebHostEnvironment HostEnvironment
 @inject PanelTimeZoneService TimeZone
+@inject ScheduledTaskService ScheduledTaskManagement
 @inject NavigationManager Navigation
+@inject CloudMailClient CloudMail
+@inject TelegramPanelAiService PanelAiService
 @using TelegramPanel.Web.Services
+@using TelegramPanel.Core.Utils
 
 <PageTitle>系统设置 - Telegram Panel</PageTitle>
 
@@ -25,10 +30,10 @@
                 <MudText Typo="Typo.h6">Telegram API 配置</MudText>
             </MudCardHeader>
             <MudCardContent>
-                <MudTextField @bind-Value="apiId" Label="默认 API ID" Variant="Variant.Outlined"
-                              HelperText="从 https://my.telegram.org 获取" />
-                <MudTextField @bind-Value="apiHash" Label="默认 API Hash" Variant="Variant.Outlined" Class="mt-3"
-                              HelperText="用于新账号登录和导入" />
+                <MudTextField @bind-Value="apiId" Label="旧版单 API ID" Variant="Variant.Outlined"
+                              HelperText="兼容旧配置；Vue 系统设置会把它带入 API 池" />
+                <MudTextField @bind-Value="apiHash" Label="旧版单 API Hash" Variant="Variant.Outlined" Class="mt-3"
+                              HelperText="32 位十六进制字符串；新界面建议使用系统设置里的 API 池" />
                 <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true" Class="mt-3">
                     <MudText Typo="Typo.body2"><strong>写入位置：</strong>@LocalConfigPath</MudText>
                     <MudText Typo="Typo.body2" Class="mt-1"><strong>文件存在：</strong>@(LocalConfigExists ? "是" : "否")</MudText>
@@ -43,15 +48,96 @@
             </MudCardActions>
         </MudCard>
 
+        <MudCard Class="mb-4">
+            <MudCardHeader>
+                <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="2">
+                    <MudText Typo="Typo.h6">Cloud Mail 对接</MudText>
+                    <MudLink Href="https://github.com/maillab/cloud-mail" Target="_blank" Underline="Underline.Always">
+                        GitHub
+                    </MudLink>
+                </MudStack>
+            </MudCardHeader>
+            <MudCardContent>
+                <MudTextField @bind-Value="cloudMailBaseUrl" Label="Cloud Mail URL" Variant="Variant.Outlined"
+                              HelperText="例如：https://mail.example.com（无需填写 /api）" />
+                <MudTextField @bind-Value="cloudMailDomain" Label="邮箱域名" Variant="Variant.Outlined" Class="mt-3"
+                              HelperText="例如：xx.com（将生成 手机号数字@xx.com）" />
+                <MudTextField @bind-Value="cloudMailToken" Label="Authorization Token" Variant="Variant.Outlined" Class="mt-3"
+                              HelperText="Cloud Mail 的全局 Token（生成新 Token 会使旧 Token 失效）" />
+
+                <MudDivider Class="my-3" />
+                <MudText Typo="Typo.subtitle2">生成 Token（可选）</MudText>
+                <MudTextField @bind-Value="cloudMailAdminEmail" Label="管理员邮箱" Variant="Variant.Outlined" Class="mt-2" />
+                <MudTextField @bind-Value="cloudMailAdminPassword" Label="管理员密码" Variant="Variant.Outlined" Class="mt-3"
+                              InputType="InputType.Password" />
+            </MudCardContent>
+            <MudCardActions>
+                <MudButton Variant="Variant.Filled" Color="Color.Primary"
+                           OnClick="@(async (MouseEventArgs _) => await SaveCloudMailConfig())">
+                    保存配置
+                </MudButton>
+                <MudButton Variant="Variant.Outlined" Color="Color.Info"
+                           Disabled="@cloudMailGeneratingToken"
+                           OnClick="@(async (MouseEventArgs _) => await GenerateCloudMailToken())">
+                    生成并填入 Token
+                </MudButton>
+            </MudCardActions>
+        </MudCard>
+
+        <MudCard Class="mb-4">
+            <MudCardHeader>
+                <MudText Typo="Typo.h6">AI 设置</MudText>
+            </MudCardHeader>
+            <MudCardContent>
+                <MudTextField @bind-Value="aiEndpoint" Label="OpenAI 自定义端点" Variant="Variant.Outlined"
+                              HelperText="只填写 https://xxx.com/v1，程序会自动拼接 /chat/completions" />
+                <MudTextField @bind-Value="aiApiKey" Label="API Key" Variant="Variant.Outlined" Class="mt-3"
+                              InputType="InputType.Password"
+                              HelperText="后续任务和模块会复用这套全局 AI 配置。" />
+                <MudTextField @bind-Value="aiDefaultModel" Label="默认模型" Variant="Variant.Outlined" Class="mt-3"
+                              HelperText="任务里未单独选择模型时，回退使用这里的默认模型。" />
+                <MudTextField @bind-Value="aiPresetModelsText" Label="预设模型（每行一个）" Variant="Variant.Outlined" Class="mt-3"
+                              Lines="4"
+                              HelperText="例如：gpt-4o-mini、qwen-vl-plus；任务编辑器会直接复用这里的预设。" />
+                <MudNumericField @bind-Value="aiRetryCount" Label="AI 失败重试次数" Variant="Variant.Outlined" Class="mt-3"
+                                 Min="0" Max="5"
+                                 HelperText="0 表示不重试；实际最多请求次数 = 1 + 重试次数。建议 2。" />
+                <MudText Typo="Typo.caption" Class="mt-2 mud-text-secondary">
+                    测试连通会直接使用当前表单里的端点、Key、模型和重试次数，不必先保存。
+                </MudText>
+            </MudCardContent>
+            <MudCardActions>
+                <MudButton Variant="Variant.Filled" Color="Color.Primary"
+                           OnClick="@(async (MouseEventArgs _) => await SaveAiConfig())">
+                    保存 AI 配置
+                </MudButton>
+                <MudButton Variant="Variant.Outlined" Color="Color.Info"
+                           Disabled="@aiTesting"
+                           OnClick="@(async (MouseEventArgs _) => await TestAiConnectionAsync())">
+                    @if (aiTesting)
+                    {
+                        <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-2" />
+                        <span>测试中...</span>
+                    }
+                    else
+                    {
+                        <span>测试连通</span>
+                    }
+                </MudButton>
+            </MudCardActions>
+        </MudCard>
+ 
         <MudCard>
             <MudCardHeader>
                 <MudText Typo="Typo.h6">批量操作设置</MudText>
             </MudCardHeader>
             <MudCardContent>
                 <MudNumericField @bind-Value="defaultDelay" Label="默认操作间隔 (毫秒)" Variant="Variant.Outlined"
-                                 Min="1000" Max="10000" HelperText="建议2000-5000ms" />
+                                 Min="1000" Max="60000" HelperText="建议2000-5000ms；最高60000ms" />
                 <MudNumericField @bind-Value="maxConcurrent" Label="最大并发任务数" Variant="Variant.Outlined" Class="mt-3"
                                  Min="1" Max="10" HelperText="同时执行的任务数量" />
+                <MudNumericField @bind-Value="historyRetentionLimit" Label="历史任务保留上限" Variant="Variant.Outlined" Class="mt-3"
+                                 Min="0" Max="5000" HelperText="仅保留最新的已完成/失败任务，0 表示不限制" />
                 <MudSwitch @bind-Value="autoRetry" Label="失败自动重试" Color="Color.Primary" Class="mt-3" />
                 @if (autoRetry)
                 {
@@ -72,7 +158,7 @@
                 <MudText Typo="Typo.h6">本地化</MudText>
             </MudCardHeader>
             <MudCardContent>
-                <MudSelect @bind-Value="timeZoneId" Label="时区（用于面板显示）" Variant="Variant.Outlined" Dense="true">
+                <MudSelect @bind-Value="timeZoneId" Label="时区（用于面板显示和 Cron 计划）" Variant="Variant.Outlined" Dense="true">
                     @foreach (var item in KnownTimeZones)
                     {
                         <MudSelectItem Value="@item.Id">@item.Label</MudSelectItem>
@@ -83,7 +169,7 @@
                 </MudText>
                 <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true" Class="mt-3">
                     <MudText Typo="Typo.body2">
-                        本项目数据库中的时间统一按 UTC 存储；该设置仅影响面板显示的时区转换。
+                        本项目数据库中的时间统一按 UTC 存储；该设置会影响面板时间显示和 Cron 计划任务的解析时区。
                     </MudText>
                 </MudAlert>
             </MudCardContent>
@@ -104,9 +190,13 @@
             <MudCardContent>
                 <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true" Class="mb-3">
                     <MudText Typo="Typo.body2">
-                        <strong>同步说明：</strong>将每个活跃账号“创建的频道 + 创建的群组”拉取并写入本地数据库，用于频道/群组列表展示，以及批量任务自动选择执行账号。
+                        <strong>同步说明：</strong>将每个活跃账号“当前可见的频道 + 当前可见的群组”拉取并写入本地数据库，用于频道/群组列表展示，以及批量任务自动选择执行账号。
                         <br />
-                        <strong>不包含：</strong>Telegram 状态检测（冻结/封号等）与验证码收取。
+                        <strong>任务中心：</strong>自动同步与“立即同步”都会记录到【任务中心】，可查看是否正在运行、已同步到第几个账号以及失败数量。
+                        <br />
+                        <strong>补充：</strong>同步过程中若遇到连接异常，会顺带执行一次轻量 Telegram 状态刷新（不做创建频道深度探测）。
+                        <br />
+                        <strong>不包含：</strong>深度 Telegram 状态检测（创建频道探测）与验证码收取。
                     </MudText>
                 </MudAlert>
 
@@ -116,10 +206,20 @@
                     <MudNumericField @bind-Value="syncInterval" Label="同步间隔 (小时)" Variant="Variant.Outlined" Class="mt-3"
                                      Min="1" Max="24" />
                 }
-                <MudButton Variant="Variant.Outlined" Color="Color.Primary" FullWidth="true" Class="mt-3"
-                           OnClick="@(async (MouseEventArgs _) => await SaveSyncConfig())">
-                    保存同步设置
-                </MudButton>
+                <MudStack Row="true" Spacing="2" Class="mt-3" Style="flex-wrap: wrap;">
+                    <MudButton Variant="Variant.Outlined" Color="Color.Primary" Class="tp-input-full-xs"
+                               Style="flex: 1; min-width: 220px;"
+                               OnClick="@(async (MouseEventArgs _) => await SaveSyncConfig())">
+                        保存同步设置
+                    </MudButton>
+
+                    <MudButton Variant="Variant.Filled" Color="Color.Info" Class="tp-input-full-xs"
+                               Style="flex: 1; min-width: 220px;"
+                               Disabled="@syncing"
+                               OnClick="@(async (MouseEventArgs _) => await SyncNow())">
+                        @(syncing ? "同步中..." : "立即同步频道/群组")
+                    </MudButton>
+                </MudStack>
 
                 <MudDivider Class="my-4" />
 
@@ -138,10 +238,6 @@
                     保存 Bot 自动同步设置
                 </MudButton>
 
-                <MudButton Variant="Variant.Outlined" Color="Color.Info" FullWidth="true" Class="mt-4"
-                           OnClick="@(async (MouseEventArgs _) => await SyncNow())">
-                    立即同步
-                </MudButton>
             </MudCardContent>
         </MudCard>
 
@@ -167,13 +263,22 @@
                 <MudText Typo="Typo.h6">日志设置</MudText>
             </MudCardHeader>
             <MudCardContent>
-                <MudSelect @bind-Value="logLevel" Label="日志级别" Variant="Variant.Outlined">
+                <MudSwitch T="bool" @bind-Value="logEnabled" Color="Color.Primary" Class="mb-2">
+                    启用日志输出
+                </MudSwitch>
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                    说明：关闭后仅输出 Error/Fatal（控制台），并停止写入日志文件。Docker 仍可能记录 stdout/stderr，建议同时在 docker-compose 配置日志滚动。
+                </MudText>
+
+                <MudSelect @bind-Value="logLevel" Label="日志级别" Variant="Variant.Outlined" Disabled="@(!logEnabled)"
+                           Class="mt-3">
                     <MudSelectItem Value='@("Debug")'>Debug</MudSelectItem>
                     <MudSelectItem Value='@("Information")'>Information</MudSelectItem>
                     <MudSelectItem Value='@("Warning")'>Warning</MudSelectItem>
                     <MudSelectItem Value='@("Error")'>Error</MudSelectItem>
                 </MudSelect>
                 <MudNumericField @bind-Value="logRetentionDays" Label="日志保留天数" Variant="Variant.Outlined" Class="mt-3"
+                                 Disabled="@(!logEnabled)"
                                  Min="1" Max="90" />
             </MudCardContent>
             <MudCardActions>
@@ -207,17 +312,31 @@
     private string apiId = "";
     private string apiHash = "";
     private int defaultDelay = 2000;
-    private int maxConcurrent = 3;
-    private bool autoRetry = true;
+    private int maxConcurrent = 1;
+    private int historyRetentionLimit = 0;
+    private bool autoRetry = false;
     private int maxRetries = 3;
     private bool autoSync = true;
     private int syncInterval = 6;
     private bool botAutoSyncEnabled = false;
     private int botAutoSyncIntervalSeconds = 2;
+    private bool logEnabled = false;
     private string logLevel = "Information";
     private int logRetentionDays = 30;
     private bool syncing = false;
     private string timeZoneId = "";
+    private string cloudMailBaseUrl = "";
+    private string cloudMailDomain = "";
+    private string cloudMailToken = "";
+    private string cloudMailAdminEmail = "";
+    private string cloudMailAdminPassword = "";
+    private bool cloudMailGeneratingToken = false;
+    private string aiEndpoint = "";
+    private string aiApiKey = "";
+    private string aiDefaultModel = "";
+    private string aiPresetModelsText = "";
+    private int aiRetryCount = 2;
+    private bool aiTesting = false;
 
     private sealed record TimeZoneChoice(string Id, string Label);
 
@@ -240,7 +359,7 @@
         }
     }
 
-    private string LocalConfigPath => LocalConfigFile.ResolvePath(Configuration, Environment);
+    private string LocalConfigPath => LocalConfigFile.ResolvePath(Configuration, HostEnvironment);
     private bool LocalConfigExists => System.IO.File.Exists(LocalConfigPath);
 
     protected override void OnInitialized()
@@ -248,24 +367,47 @@
         // 从配置文件加载默认设置
         apiId = Configuration["Telegram:ApiId"] ?? "";
         apiHash = Configuration["Telegram:ApiHash"] ?? "";
+        defaultDelay = Configuration.GetValue("Telegram:DefaultDelayMs", 2000);
+        maxConcurrent = Configuration.GetValue("BatchTasks:MaxConcurrent", 1);
+        historyRetentionLimit = Configuration.GetValue("BatchTasks:HistoryRetentionLimit", 0);
+        maxRetries = Configuration.GetValue("Telegram:MaxRetries", 0);
+        autoRetry = maxRetries > 0;
+        if (maxRetries <= 0) maxRetries = 3;
         autoSync = Configuration.GetValue("Sync:AutoSyncEnabled", false);
         syncInterval = Configuration.GetValue("Sync:IntervalHours", 6);
         botAutoSyncEnabled = Configuration.GetValue("Telegram:BotAutoSyncEnabled", false);
         botAutoSyncIntervalSeconds = Configuration.GetValue("Telegram:BotAutoSyncIntervalSeconds", 2);
+        logEnabled = Configuration.GetValue("Serilog:Enabled", false);
+        logLevel = (Configuration["Serilog:MinimumLevel:Default"] ?? "Information").Trim();
+        logRetentionDays = Configuration.GetValue("Serilog:RetainedFileCountLimit", 30);
         timeZoneId = Configuration["System:TimeZoneId"] ?? "";
+        cloudMailBaseUrl = Configuration["CloudMail:BaseUrl"] ?? "";
+        cloudMailDomain = Configuration["CloudMail:Domain"] ?? "";
+        cloudMailToken = Configuration["CloudMail:Token"] ?? "";
+        aiEndpoint = Configuration["AI:OpenAI:Endpoint"] ?? "";
+        aiApiKey = Configuration["AI:OpenAI:ApiKey"] ?? "";
+        aiDefaultModel = Configuration["AI:OpenAI:DefaultModel"] ?? "";
+        aiPresetModelsText = string.Join(System.Environment.NewLine, Configuration.GetSection("AI:OpenAI:PresetModels").GetChildren().Select(x => x.Value).Where(x => !string.IsNullOrWhiteSpace(x)));
+        aiRetryCount = AiOpenAiSettingsSnapshot.NormalizeRetryCount(Configuration.GetValue("AI:OpenAI:RetryCount", 2));
     }
 
     private async Task SaveApiConfig()
     {
         if (!int.TryParse(apiId, out int parsedApiId) || parsedApiId <= 0)
         {
-            Snackbar.Add("默认 API ID 格式错误", Severity.Error);
+            Snackbar.Add("旧版单 API ID 格式错误", Severity.Error);
             return;
         }
 
         if (string.IsNullOrWhiteSpace(apiHash))
         {
-            Snackbar.Add("默认 API Hash 不能为空", Severity.Error);
+            Snackbar.Add("旧版单 API Hash 不能为空", Severity.Error);
+            return;
+        }
+
+        if (!TelegramApiConfigValidator.TryNormalizeApiHash(apiHash, out var normalizedApiHash, out var apiHashReason))
+        {
+            Snackbar.Add($"旧版单 API Hash 无效：{apiHashReason}", Severity.Error);
             return;
         }
 
@@ -275,7 +417,7 @@
             var root = await LoadOrCreateLocalConfigAsync();
             var telegram = EnsureObject(root, "Telegram");
             telegram["ApiId"] = parsedApiId;
-            telegram["ApiHash"] = apiHash.Trim();
+            telegram["ApiHash"] = normalizedApiHash;
             await SaveLocalConfigAsync(root);
 
             // 配置变更后清理客户端缓存，确保后续操作使用新 ApiId/ApiHash
@@ -326,6 +468,170 @@
         }
     }
 
+    private async Task SaveCloudMailConfig()
+    {
+        try
+        {
+            var root = await LoadOrCreateLocalConfigAsync();
+            var cloud = EnsureObject(root, "CloudMail");
+            cloud["BaseUrl"] = (cloudMailBaseUrl ?? string.Empty).Trim();
+            cloud["Domain"] = (cloudMailDomain ?? string.Empty).Trim().TrimStart('@');
+            cloud["Token"] = (cloudMailToken ?? string.Empty).Trim();
+            await SaveLocalConfigAsync(root);
+
+            Snackbar.Add("Cloud Mail 配置已保存（配置热重载后生效）", Severity.Success);
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存失败：{ex.Message}（路径：{LocalConfigPath}）", Severity.Error);
+        }
+    }
+
+    private async Task SaveAiConfig()
+    {
+        if (aiRetryCount < 0 || aiRetryCount > 5)
+        {
+            Snackbar.Add("AI 失败重试次数范围应为 0-5", Severity.Error);
+            return;
+        }
+
+        try
+        {
+            var normalizedEndpoint = AiOpenAiSettingsSnapshot.NormalizeEndpoint(aiEndpoint);
+            var normalizedApiKey = AiOpenAiSettingsSnapshot.NormalizeApiKey(aiApiKey);
+            var normalizedDefaultModel = AiOpenAiSettingsSnapshot.NormalizeModel(aiDefaultModel);
+            var presetModels = AiOpenAiSettingsSnapshot.NormalizeModelEntries(ParseLines(aiPresetModelsText), normalizedDefaultModel);
+            var normalizedRetryCount = AiOpenAiSettingsSnapshot.NormalizeRetryCount(aiRetryCount);
+
+            var root = await LoadOrCreateLocalConfigAsync();
+            var ai = EnsureObject(root, "AI");
+            var openAi = EnsureObject(ai, "OpenAI");
+
+            openAi["Endpoint"] = normalizedEndpoint ?? string.Empty;
+            openAi["ApiKey"] = normalizedApiKey ?? string.Empty;
+            openAi["DefaultModel"] = normalizedDefaultModel ?? string.Empty;
+            openAi["RetryCount"] = normalizedRetryCount;
+
+            var modelsArray = new System.Text.Json.Nodes.JsonArray();
+            foreach (var model in presetModels)
+                modelsArray.Add(model);
+            openAi["PresetModels"] = modelsArray;
+
+            await SaveLocalConfigAsync(root);
+
+            aiEndpoint = normalizedEndpoint ?? string.Empty;
+            aiApiKey = normalizedApiKey ?? string.Empty;
+            aiDefaultModel = normalizedDefaultModel ?? string.Empty;
+            aiPresetModelsText = string.Join(System.Environment.NewLine, presetModels);
+            aiRetryCount = normalizedRetryCount;
+
+            Snackbar.Add("AI 配置已保存（配置热重载后生效）", Severity.Success);
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存失败：{ex.Message}（路径：{LocalConfigPath}）", Severity.Error);
+        }
+    }
+
+    private async Task TestAiConnectionAsync()
+    {
+        if (aiTesting)
+            return;
+
+        if (aiRetryCount < 0 || aiRetryCount > 5)
+        {
+            Snackbar.Add("AI 失败重试次数范围应为 0-5", Severity.Error);
+            return;
+        }
+
+        aiTesting = true;
+        try
+        {
+            var normalizedEndpoint = AiOpenAiSettingsSnapshot.NormalizeEndpoint(aiEndpoint);
+            var normalizedApiKey = AiOpenAiSettingsSnapshot.NormalizeApiKey(aiApiKey);
+            var normalizedDefaultModel = AiOpenAiSettingsSnapshot.NormalizeModel(aiDefaultModel);
+            var presetModels = AiOpenAiSettingsSnapshot.NormalizeModelEntries(ParseLines(aiPresetModelsText), normalizedDefaultModel);
+            var normalizedRetryCount = AiOpenAiSettingsSnapshot.NormalizeRetryCount(aiRetryCount);
+            var snapshot = new AiOpenAiSettingsSnapshot(normalizedEndpoint, normalizedApiKey, normalizedDefaultModel, presetModels, normalizedRetryCount);
+            var testModel = ResolveAiTestModel(snapshot);
+
+            if (!snapshot.TryValidateForTask(testModel, out var validateError))
+            {
+                Snackbar.Add($"AI 连通测试失败：{validateError}", Severity.Warning);
+                return;
+            }
+
+            var result = await PanelAiService.TestConnectionAsync(snapshot, testModel, CancellationToken.None);
+            if (!result.Success)
+            {
+                Snackbar.Add($"AI 连通测试失败：{result.Error}", Severity.Error);
+                return;
+            }
+
+            var modelName = result.Model ?? snapshot.ResolveModel(testModel) ?? "（未知模型）";
+            var preview = string.IsNullOrWhiteSpace(result.ResponseText) ? "（空响应）" : result.ResponseText;
+            Snackbar.Add($"AI 连通成功：模型 {modelName}，返回 {preview}", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"AI 连通测试失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            aiTesting = false;
+            StateHasChanged();
+        }
+    }
+
+    private string? ResolveAiTestModel(AiOpenAiSettingsSnapshot snapshot)
+    {
+        var defaultModel = AiOpenAiSettingsSnapshot.NormalizeModel(aiDefaultModel);
+        if (!string.IsNullOrWhiteSpace(defaultModel))
+            return defaultModel;
+
+        return snapshot.PresetModels.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+    }
+
+    private async Task GenerateCloudMailToken()
+    {
+        if (cloudMailGeneratingToken)
+            return;
+
+        var baseUrl = (cloudMailBaseUrl ?? string.Empty).Trim();
+        var email = (cloudMailAdminEmail ?? string.Empty).Trim();
+        var password = cloudMailAdminPassword ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            Snackbar.Add("请先填写 Cloud Mail URL", Severity.Warning);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
+        {
+            Snackbar.Add("请填写管理员邮箱和密码", Severity.Warning);
+            return;
+        }
+
+        cloudMailGeneratingToken = true;
+        try
+        {
+            var token = await CloudMail.GenerateTokenAsync(baseUrl, email, password, CancellationToken.None);
+            cloudMailToken = token;
+            Snackbar.Add("Token 已生成并填入（记得点击“保存配置”）", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"生成 Token 失败：{ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            cloudMailGeneratingToken = false;
+        }
+    }
+
     private async Task SaveBotAutoSyncConfig()
     {
         if (botAutoSyncEnabled && (botAutoSyncIntervalSeconds < 2 || botAutoSyncIntervalSeconds > 60))
@@ -360,8 +666,12 @@
             var system = EnsureObject(root, "System");
             system["TimeZoneId"] = id;
             await SaveLocalConfigAsync(root);
+            TimeZone.ApplyTimeZoneId(id);
+            var updated = await ScheduledTaskManagement.RecalculateNextRunsAsync(DateTime.UtcNow);
 
-            Snackbar.Add("时区设置已保存（配置热重载后生效）", Severity.Success);
+            Snackbar.Add(updated > 0
+                ? $"时区设置已保存，已按新时区重算 {updated} 条计划任务"
+                : "时区设置已保存", Severity.Success);
             StateHasChanged();
         }
         catch (Exception ex)
@@ -392,7 +702,7 @@
 
     private async Task SaveLocalConfigAsync(System.Text.Json.Nodes.JsonObject root)
     {
-        var json = root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+        var json = LocalConfigFile.ToIndentedJson(root);
         var path = LocalConfigPath;
         await LocalConfigFile.EnsureExistsAsync(path);
         await LocalConfigFile.WriteJsonAtomicallyAsync(path, json);
@@ -408,18 +718,115 @@
         return created;
     }
 
-    private Task SaveBatchConfig()
+    private static List<string> ParseLines(string? text)
     {
-        // TODO: 实现配置保存到文件
-        Snackbar.Add("批量操作配置已保存", Severity.Success);
-        return Task.CompletedTask;
+        if (string.IsNullOrWhiteSpace(text))
+            return new List<string>();
+
+        return text
+            .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => (x ?? string.Empty).Trim())
+            .Where(x => x.Length > 0)
+            .ToList();
+    }
+
+    private async Task SaveBatchConfig()
+    {
+        if (defaultDelay < 1000 || defaultDelay > 60000)
+        {
+            Snackbar.Add("默认操作间隔范围应为 1000-60000ms", Severity.Error);
+            return;
+        }
+
+        if (maxConcurrent < 1 || maxConcurrent > 10)
+        {
+            Snackbar.Add("最大并发任务数范围应为 1-10", Severity.Error);
+            return;
+        }
+
+        if (autoRetry && (maxRetries < 1 || maxRetries > 5))
+        {
+            Snackbar.Add("最大重试次数范围应为 1-5", Severity.Error);
+            return;
+        }
+
+        if (historyRetentionLimit < 0 || historyRetentionLimit > 5000)
+        {
+            Snackbar.Add("历史任务保留上限范围应为 0-5000", Severity.Error);
+            return;
+        }
+
+        try
+        {
+            var root = await LoadOrCreateLocalConfigAsync();
+
+            var telegram = EnsureObject(root, "Telegram");
+            telegram["DefaultDelayMs"] = defaultDelay;
+            telegram["MaxRetries"] = autoRetry ? maxRetries : 0;
+
+            var batchTasks = EnsureObject(root, "BatchTasks");
+            batchTasks["MaxConcurrent"] = maxConcurrent;
+            batchTasks["HistoryRetentionLimit"] = historyRetentionLimit;
+
+            await SaveLocalConfigAsync(root);
+
+            var deletedCount = historyRetentionLimit > 0
+                ? await TaskManagement.TrimHistoryTasksAsync(historyRetentionLimit)
+                : 0;
+
+            var message = deletedCount > 0
+                ? $"批量操作配置已保存，并已清理 {deletedCount} 条超出上限的历史任务"
+                : "批量操作配置已保存（配置热重载后生效）";
+
+            Snackbar.Add(message, Severity.Success);
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存失败：{ex.Message}（路径：{LocalConfigPath}）", Severity.Error);
+        }
     }
 
     private Task SaveLogConfig()
     {
-        // TODO: 实现配置保存到文件
-        Snackbar.Add("日志配置已保存", Severity.Success);
-        return Task.CompletedTask;
+        return SaveLogConfigAsync();
+    }
+
+    private async Task SaveLogConfigAsync()
+    {
+        var level = (logLevel ?? "Information").Trim();
+        if (level is not ("Debug" or "Information" or "Warning" or "Error"))
+        {
+            Snackbar.Add("日志级别无效", Severity.Error);
+            return;
+        }
+
+        if (logRetentionDays < 1 || logRetentionDays > 90)
+        {
+            Snackbar.Add("日志保留天数范围应为 1-90", Severity.Error);
+            return;
+        }
+
+        try
+        {
+            var root = await LoadOrCreateLocalConfigAsync();
+            var serilog = EnsureObject(root, "Serilog");
+            serilog["Enabled"] = logEnabled;
+
+            var minimumLevel = EnsureObject(serilog, "MinimumLevel");
+            minimumLevel["Default"] = level;
+
+            // 程序使用按天滚动的日志文件，因此“保留天数”可以映射到“保留文件数”。
+            serilog["RetainedFileCountLimit"] = logRetentionDays;
+
+            await SaveLocalConfigAsync(root);
+            Snackbar.Add("日志配置已保存（重启后生效）", Severity.Success);
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"保存失败：{ex.Message}（路径：{LocalConfigPath}）", Severity.Error);
+        }
     }
 
     private async Task SyncNow()
@@ -431,20 +838,16 @@
         }
 
         syncing = true;
-        Snackbar.Add("开始同步频道和群组信息...", Severity.Info);
+        Snackbar.Add("正在后台创建同步任务...", Severity.Info);
 
         try
         {
-            var summary = await DataSync.SyncAllActiveAccountsAsync(CancellationToken.None);
-
-            foreach (var failure in summary.AccountFailures)
-                Snackbar.Add($"账号 {failure.Phone} 同步失败：{failure.Error}", Severity.Warning);
-
-            Snackbar.Add($"同步完成：{summary.TotalChannelsSynced} 个频道，{summary.TotalGroupsSynced} 个群组", summary.AccountFailures.Count == 0 ? Severity.Success : Severity.Warning);
+            var taskId = await DataSync.StartAllActiveAccountsTrackedInBackgroundAsync("manual", CancellationToken.None);
+            Snackbar.Add($"已启动后台同步任务 #{taskId}，请到任务中心查看进度", Severity.Success);
         }
         catch (Exception ex)
         {
-            Snackbar.Add($"同步失败：{ex.Message}", Severity.Error);
+            Snackbar.Add($"同步启动失败：{ex.Message}", Severity.Error);
         }
         finally
         {

@@ -6,6 +6,7 @@ namespace TelegramPanel.Web.Services;
 
 public sealed class AdminCredentialStore
 {
+    private readonly IConfiguration _configuration;
     private readonly IWebHostEnvironment _environment;
     private readonly IOptionsMonitor<AdminAuthOptions> _options;
     private readonly ILogger<AdminCredentialStore> _logger;
@@ -14,10 +15,12 @@ public sealed class AdminCredentialStore
     private AdminCredentialFile? _cached;
 
     public AdminCredentialStore(
+        IConfiguration configuration,
         IWebHostEnvironment environment,
         IOptionsMonitor<AdminAuthOptions> options,
         ILogger<AdminCredentialStore> logger)
     {
+        _configuration = configuration;
         _environment = environment;
         _options = options;
         _logger = logger;
@@ -29,7 +32,12 @@ public sealed class AdminCredentialStore
 
     public bool MustChangePassword => _cached?.MustChangePassword == true;
 
-    public string CredentialsFilePath => Path.Combine(_environment.ContentRootPath, _options.CurrentValue.CredentialsPath);
+    public string CredentialsFilePath =>
+        StoragePathResolver.ResolveWritablePath(
+            _configuration,
+            _environment,
+            _options.CurrentValue.CredentialsPath,
+            "admin_auth.json");
 
     public async Task EnsureInitializedAsync(CancellationToken cancellationToken = default)
     {
@@ -51,8 +59,8 @@ public sealed class AdminCredentialStore
             }
 
             var opt = _options.CurrentValue;
-            var initialUsername = (opt.InitialUsername ?? "admin").Trim();
-            var initialPassword = (opt.InitialPassword ?? "admin123").Trim();
+            var initialUsername = (opt.InitialUsername ?? "tgpanel").Trim();
+            var initialPassword = (opt.InitialPassword ?? "tgpanel123").Trim();
             if (string.IsNullOrWhiteSpace(initialUsername) || string.IsNullOrWhiteSpace(initialPassword))
                 throw new InvalidOperationException("AdminAuth 初始账号/密码未配置");
 
@@ -118,11 +126,42 @@ public sealed class AdminCredentialStore
                 throw new InvalidOperationException("当前密码错误");
 
             var now = DateTime.UtcNow;
-            var updated = CreateCredentialFile(file.Username, newPassword, mustChangePassword: false, now);
-            updated.CreatedAtUtc = file.CreatedAtUtc;
+            ApplyPassword(file, newPassword);
+            file.MustChangePassword = false;
+            file.UpdatedAtUtc = now;
 
-            await SaveAsync(updated, cancellationToken);
-            _cached = updated;
+            await SaveAsync(file, cancellationToken);
+            _cached = file;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task ChangeUsernameAsync(string currentPassword, string newUsername, CancellationToken cancellationToken = default)
+    {
+        if (!Enabled)
+            throw new InvalidOperationException("后台验证未启用");
+
+        await EnsureInitializedAsync(cancellationToken);
+
+        currentPassword = (currentPassword ?? string.Empty).Trim();
+        newUsername = NormalizeUsername(newUsername);
+
+        await _lock.WaitAsync(cancellationToken);
+        try
+        {
+            var file = _cached ?? throw new InvalidOperationException("凭据未初始化");
+            if (!VerifyPassword(file, currentPassword))
+                throw new InvalidOperationException("当前密码错误");
+
+            file.Username = newUsername;
+            file.MustChangePassword = false;
+            file.UpdatedAtUtc = DateTime.UtcNow;
+
+            await SaveAsync(file, cancellationToken);
+            _cached = file;
         }
         finally
         {
@@ -133,27 +172,74 @@ public sealed class AdminCredentialStore
     private async Task SaveAsync(AdminCredentialFile file, CancellationToken cancellationToken)
     {
         var path = CredentialsFilePath;
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(dir))
+            Directory.CreateDirectory(dir);
+
         var json = JsonSerializer.Serialize(file, new JsonSerializerOptions { WriteIndented = true });
         await File.WriteAllTextAsync(path, json, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
     }
 
     private static AdminCredentialFile CreateCredentialFile(string username, string password, bool mustChangePassword, DateTime nowUtc)
     {
-        var salt = RandomNumberGenerator.GetBytes(16);
-        var iterations = 150_000;
-        var hash = HashPassword(password, salt, iterations);
-
-        return new AdminCredentialFile
+        username = NormalizeUsername(username);
+        var file = new AdminCredentialFile
         {
             Version = 1,
             Username = username,
-            SaltBase64 = Convert.ToBase64String(salt),
-            HashBase64 = Convert.ToBase64String(hash),
-            Iterations = iterations,
             MustChangePassword = mustChangePassword,
             CreatedAtUtc = nowUtc,
             UpdatedAtUtc = nowUtc
         };
+        ApplyPassword(file, password);
+        return file;
+    }
+
+    private static void ApplyPassword(AdminCredentialFile file, string password)
+    {
+        var salt = RandomNumberGenerator.GetBytes(16);
+        const int iterations = 150_000;
+        file.SaltBase64 = Convert.ToBase64String(salt);
+        file.HashBase64 = Convert.ToBase64String(HashPassword(password, salt, iterations));
+        file.Iterations = iterations;
+    }
+
+    internal static bool TryNormalizeUsername(
+        string? username,
+        out string normalizedUsername,
+        out string? error)
+    {
+        normalizedUsername = (username ?? string.Empty).Trim();
+        if (normalizedUsername.Length < 4 || normalizedUsername.Length > 32)
+        {
+            error = "后台用户名长度应为 4-32 位";
+            return false;
+        }
+
+        if (!normalizedUsername.All(ch => char.IsLetterOrDigit(ch) || ch is '_' or '-' or '.'))
+        {
+            error = "后台用户名只能包含字母、数字、下划线、短横线或点";
+            return false;
+        }
+
+        if (string.Equals(normalizedUsername, "admin", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalizedUsername, "administrator", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalizedUsername, "root", StringComparison.OrdinalIgnoreCase))
+        {
+            error = "请不要使用常见后台用户名";
+            return false;
+        }
+
+        error = null;
+        return true;
+    }
+
+    private static string NormalizeUsername(string? username)
+    {
+        if (!TryNormalizeUsername(username, out var normalizedUsername, out var error))
+            throw new InvalidOperationException(error);
+
+        return normalizedUsername;
     }
 
     private static byte[] HashPassword(string password, byte[] salt, int iterations)

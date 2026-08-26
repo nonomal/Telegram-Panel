@@ -31,6 +31,7 @@ public static class TelegramAccountWasteJudge
         if (summary.Length == 0)
             return false;
 
+        // 网络、代理、超时和探测类故障不判废；只有下列明确不可恢复状态才允许清理。
         // 1) 明确的封禁/失效
         if (summary.Contains("账号被封禁", StringComparison.OrdinalIgnoreCase)
             || summary.Contains("被封禁/停用", StringComparison.OrdinalIgnoreCase)
@@ -41,23 +42,25 @@ public static class TelegramAccountWasteJudge
             return true;
         }
 
-        // 连接失败/探测失败：在“出售前清理废号”的场景下，用户预期将其视为不可用账号直接清理。
-        if (summary.Contains("连接失败", StringComparison.OrdinalIgnoreCase))
-        {
-            reason = "连接失败（无法连通 Telegram）";
-            return true;
-        }
-
-        if (summary.Contains("创建频道探测失败", StringComparison.OrdinalIgnoreCase))
-        {
-            reason = "创建频道探测失败（创建频道能力异常）";
-            return true;
-        }
-
         if (summary.Contains("Session 失效", StringComparison.OrdinalIgnoreCase)
             || summary.Contains("AUTH_KEY_UNREGISTERED", StringComparison.OrdinalIgnoreCase))
         {
             reason = "Session 失效";
+            return true;
+        }
+
+        // Session 冲突/撤销：实际使用中通常都需要重新登录生成新 session，否则无法稳定使用
+        if (summary.Contains("Session 冲突", StringComparison.OrdinalIgnoreCase)
+            || summary.Contains("AUTH_KEY_DUPLICATED", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "Session 冲突";
+            return true;
+        }
+
+        if (summary.Contains("Session 已被撤销", StringComparison.OrdinalIgnoreCase)
+            || summary.Contains("SESSION_REVOKED", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "Session 已被撤销";
             return true;
         }
 

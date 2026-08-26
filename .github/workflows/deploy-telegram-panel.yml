@@ -1,0 +1,101 @@
+name: Deploy Telegram Panel
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Docker image to deploy
+        required: true
+        default: ghcr.io/moeacgx/telegram-panel:dev-latest
+      update_mode:
+        description: Update source mode written to the cloud data volume
+        required: true
+        default: auto
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Deploy on production host
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.TELEGRAM_PANEL_PROD_HOST }}
+          port: ${{ secrets.TELEGRAM_PANEL_PROD_PORT }}
+          username: ${{ secrets.TELEGRAM_PANEL_PROD_USER }}
+          password: ${{ secrets.TELEGRAM_PANEL_PROD_PASSWORD }}
+          envs: DEPLOY_UPDATE_MODE
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+
+            APP_DIR=/home/docker/Telegram-Panel
+            DATA_DIR="$APP_DIR/docker-data"
+            BACKUP_DIR="$APP_DIR/backups"
+            IMAGE="${{ github.event.inputs.image }}"
+            UPDATE_MODE="${DEPLOY_UPDATE_MODE:-auto}"
+
+            case "$UPDATE_MODE" in
+              auto|image|binary) ;;
+              *)
+                echo "Unsupported update mode: $UPDATE_MODE" >&2
+                exit 1
+                ;;
+            esac
+
+            test -d "$APP_DIR"
+            test -f "$APP_DIR/docker-compose.yml"
+            mkdir -p "$BACKUP_DIR"
+
+            ts="$(date +%Y%m%d%H%M%S)"
+            if [ -d "$DATA_DIR" ]; then
+              cd "$DATA_DIR"
+              tar -czf "$BACKUP_DIR/telegram-panel-db-$ts.tgz" \
+                telegram-panel.db telegram-panel.db-wal telegram-panel.db-shm 2>/dev/null || true
+            fi
+
+            cd "$APP_DIR"
+            DEPLOY_REF="${{ github.ref_name }}"
+            git fetch origin "$DEPLOY_REF"
+            if git show-ref --verify --quiet "refs/heads/$DEPLOY_REF"; then
+              git checkout "$DEPLOY_REF"
+            else
+              git checkout -b "$DEPLOY_REF" "origin/$DEPLOY_REF"
+            fi
+            git pull --ff-only origin "$DEPLOY_REF"
+
+            if [ -f .env ]; then
+              if grep -q '^TP_IMAGE=' .env; then
+                sed -i "s#^TP_IMAGE=.*#TP_IMAGE=$IMAGE#" .env
+              else
+                printf '\nTP_IMAGE=%s\n' "$IMAGE" >> .env
+              fi
+            else
+              printf 'TP_IMAGE=%s\n' "$IMAGE" > .env
+            fi
+
+            printf '%s\n' "$UPDATE_MODE" > "$DATA_DIR/update-mode.txt"
+
+            docker pull "$IMAGE"
+            if [ -f docker-compose.warp.yml ]; then
+              docker compose \
+                -f docker-compose.yml \
+                -f docker-compose.warp.yml \
+                up -d --force-recreate telegram-panel
+            else
+              docker compose up -d --force-recreate telegram-panel
+            fi
+
+            sleep 5
+            docker ps --filter name=telegram-panel --format 'container={{.Names}} image={{.Image}} status={{.Status}}'
+            docker logs --tail 120 telegram-panel
+            curl -fsS -I http://127.0.0.1:5000/ui/dashboard
+            VERSION_RESPONSE="$(curl -fsS http://127.0.0.1:5000/api/panel/auth/me)"
+            printf '%s\n' "$VERSION_RESPONSE"
+            EXPECTED_VERSION="$(docker run --rm --entrypoint sh "$IMAGE" -c 'cat /app/version.txt')"
+            if ! printf '%s' "$VERSION_RESPONSE" | grep -Fq "\"version\":\"$EXPECTED_VERSION\""; then
+              echo "运行版本与镜像版本不一致：镜像=$EXPECTED_VERSION 响应=$VERSION_RESPONSE" >&2
+              exit 1
+            fi
+        env:
+          DEPLOY_UPDATE_MODE: ${{ github.event.inputs.update_mode }}

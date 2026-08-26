@@ -1,4 +1,4 @@
-@page "/channels/create"
+﻿@page "/channels/create"
 @inject IChannelService ChannelService
 @inject AccountManagementService AccountManagement
 @inject TelegramPanel.Core.Services.AccountRiskService RiskService
@@ -172,37 +172,65 @@
             // 调用 Telegram API 创建频道
             var channelInfo = await ChannelService.CreateChannelAsync(selectedAccountId, channelTitle, channelAbout, isPublic);
 
-            // 如果是公开频道，设置用户名
-            if (isPublic && !string.IsNullOrEmpty(username))
-            {
-                await ChannelService.SetChannelVisibilityAsync(selectedAccountId, channelInfo.TelegramId, true, username);
-            }
-
-            // 是否允许转发（关闭=保护内容）
-            if (!allowForwarding)
-            {
-                await ChannelService.SetForwardingAllowedAsync(selectedAccountId, channelInfo.TelegramId, allowed: false);
-            }
-
             // 保存到数据库
+            var now = DateTime.UtcNow;
             var channel = new Channel
             {
                 TelegramId = channelInfo.TelegramId,
                 AccessHash = channelInfo.AccessHash,
                 Title = channelTitle,
-                Username = isPublic ? username : null,
+                Username = channelInfo.Username,
                 IsBroadcast = channelInfo.IsBroadcast,
                 MemberCount = channelInfo.MemberCount,
                 About = channelAbout,
                 CreatorAccountId = selectedAccountId,
                 GroupId = selectedGroupId > 0 ? selectedGroupId : null,
-                CreatedAt = DateTime.UtcNow,
-                SyncedAt = DateTime.UtcNow
+                CreatedAt = now,
+                SyncedAt = now,
+                SystemCreatedAtUtc = now
             };
 
-            await ChannelManagement.CreateOrUpdateChannelAsync(channel);
+            var savedChannel = await ChannelManagement.CreateOrUpdateChannelAsync(channel);
+            var warnings = new List<string>();
 
-            Snackbar.Add($"频道 \"{channelTitle}\" 创建成功", Severity.Success);
+            if (isPublic && !string.IsNullOrEmpty(username))
+            {
+                try
+                {
+                    if (await ChannelService.SetChannelVisibilityAsync(selectedAccountId, channelInfo.TelegramId, true, username))
+                    {
+                        savedChannel.Username = username;
+                        await ChannelManagement.UpdateChannelAsync(savedChannel);
+                    }
+                    else
+                    {
+                        warnings.Add("公开用户名未设置成功");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add($"公开用户名未设置：{ex.Message}");
+                }
+            }
+
+            if (!allowForwarding)
+            {
+                try
+                {
+                    if (!await ChannelService.SetForwardingAllowedAsync(selectedAccountId, channelInfo.TelegramId, allowed: false))
+                        warnings.Add("禁止转发未设置成功");
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add($"禁止转发未设置：{ex.Message}");
+                }
+            }
+
+            Snackbar.Add(
+                warnings.Count == 0
+                    ? $"频道 \"{channelTitle}\" 创建成功"
+                    : $"频道已创建，但部分设置未完成：{string.Join("；", warnings)}",
+                warnings.Count == 0 ? Severity.Success : Severity.Warning);
             Navigation.NavigateTo("/channels");
         }
         catch (Exception ex)
@@ -232,3 +260,5 @@
         return namePart;
     }
 }
+
+

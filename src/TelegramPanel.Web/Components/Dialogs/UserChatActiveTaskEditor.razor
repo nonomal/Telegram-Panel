@@ -1,0 +1,894 @@
+@inject AccountCategoryManagementService CategoryManagement
+@inject DataDictionaryService DictionaryService
+@inject TemplateRenderingService TemplateRendering
+@inject Microsoft.Extensions.Options.IOptionsMonitor<AiOpenAiOptions> AiOptionsMonitor
+@using System.Text.Json
+@using System.Text.RegularExpressions
+@using TelegramPanel.Data.Entities
+@using TelegramPanel.Modules
+@using TelegramPanel.Web.Services
+@using Microsoft.AspNetCore.Components
+
+<MudStack Spacing="2">
+    <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
+        持续活跃任务会在后台循环执行并按间隔发送内容。MaxMessages=0 表示持续运行，直到你在任务中心手动取消。
+        目标支持群组、频道、Bot 用户名/链接和文本字典变量；每条消息规则支持多段文字、图片字典、<code>{time}</code> 和文本字典变量。
+    </MudAlert>
+
+    @if (loading)
+    {
+        <MudProgressCircular Indeterminate="true" Color="Color.Primary" Size="Size.Small" />
+        <MudText Typo="Typo.caption">正在加载账号分类...</MudText>
+    }
+    else
+    {
+        <MudSelect T="int"
+                   Label="执行账号分类（可多选）"
+                   Variant="Variant.Outlined"
+                   Dense="true"
+                   MultiSelection="true"
+                   SelectedValues="selectedCategoryIds"
+                   SelectedValuesChanged="OnSelectedCategoriesChanged"
+                   HelperText="可勾选多个分类，任务会从所有选中分类中抽取可用账号。">
+            @foreach (var c in categories)
+            {
+                <MudSelectItem Value="@c.Id">@c.Name</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudTextField @bind-Value="targetsText" @bind-Value:after="OnInputsChanged"
+                      Label="目标群组/频道/Bot（每行一个）"
+                      Variant="Variant.Outlined"
+                      Lines="5"
+                      Immediate="true"
+                      HelperText="支持固定目标或文本字典变量，例如 {groups}。字典内容可放 t.me 链接、at 用户名、频道ID、Bot 用户名/链接；每行、空格或逗号分隔均可。" />
+
+        <MudSelect T="string" @bind-Value="messageActionMode" @bind-Value:after="OnInputsChanged"
+                   Label="发送动作" Variant="Variant.Outlined" Dense="true"
+                   HelperText="发送消息规则可选回复指定消息；转发模式会把来源消息转发到目标，支持保留或隐藏引用来源。">
+            <MudSelectItem Value="@UserChatActiveMessageActionModes.SendGeneratedText">发送消息规则</MudSelectItem>
+            <MudSelectItem Value="@UserChatActiveMessageActionModes.ForwardUrl">转发消息链接</MudSelectItem>
+        </MudSelect>
+
+        <MudSwitch T="bool" @bind-Value="skipIfLastMessageFromSelf" @bind-Value:after="OnInputsChanged"
+                   Label="去重发送：上一条普通消息仍是当前执行账号时跳过本轮" Color="Color.Primary" />
+
+        @if (IsGeneratedMessageMode)
+        {
+            <MudTextField @bind-Value="replyToMessageUrl" @bind-Value:after="OnInputsChanged"
+                          Label="回复消息链接" Variant="Variant.Outlined" Immediate="true"
+                          HelperText="可选，例如 https://t.me/channel/123；新消息会回复这条链接对应的消息。" />
+
+
+            <MudPaper Outlined="true" Class="pa-3">
+                <MudStack Spacing="2">
+                    <MudStack Row="true" Justify="Justify.SpaceBetween" AlignItems="AlignItems.Start">
+                        <div>
+                            <MudText Typo="Typo.subtitle2">消息规则</MudText>
+                            <MudText Typo="Typo.caption">规则按消息规则模式随机或队列循环；每条规则可以是多段文字、图片字典，或图片 + 说明文字。</MudText>
+                        </div>
+                        <MudButton Size="Size.Small" Variant="Variant.Outlined" Color="Color.Primary" OnClick="AddMessageRule">添加规则</MudButton>
+                    </MudStack>
+
+                    @foreach (var item in messageRules.Select((Rule, Index) => new { Rule, Index }))
+                    {
+                        <MudPaper Outlined="true" Class="pa-3">
+                            <MudStack Spacing="1">
+                                <MudStack Row="true" Justify="Justify.SpaceBetween" AlignItems="AlignItems.Center">
+                                    <MudText Typo="Typo.subtitle2">规则 @(item.Index + 1)</MudText>
+                                    <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Error" Disabled="@(messageRules.Count <= 1)" OnClick="@(() => RemoveMessageRule(item.Index))">删除</MudButton>
+                                </MudStack>
+                                <MudTextField @bind-Value="item.Rule.Text" @bind-Value:after="OnInputsChanged"
+                                              Label="消息内容"
+                                              Variant="Variant.Outlined"
+                                              Lines="4"
+                                              Immediate="true"
+                                              HelperText="可写多行段落，支持 {time} 和文本字典变量；留空时可只发送图片。" />
+                                <MudSelect T="string"
+                                           @bind-Value="item.Rule.ImageDictionaryName"
+                                           @bind-Value:after="OnInputsChanged"
+                                           Label="图片字典"
+                                           Variant="Variant.Outlined"
+                                           Dense="true">
+                                    <MudSelectItem Value="@string.Empty">不发送图片</MudSelectItem>
+                                    @foreach (var name in imageDictionaryNames)
+                                    {
+                                        <MudSelectItem Value="@name">@name</MudSelectItem>
+                                    }
+                                </MudSelect>
+                            </MudStack>
+                        </MudPaper>
+                    }
+
+                    <MudTextField @bind-Value="bulkRulesText"
+                                  Label="批量追加"
+                                  Variant="Variant.Outlined"
+                                  Lines="3"
+                                  Immediate="true"
+                                  HelperText="一行一条文字消息；点击追加后会生成多条规则。需要段落格式时，直接在上方规则卡片里写多行。" />
+                    <MudButton Size="Size.Small" Variant="Variant.Outlined" OnClick="AppendBulkRules">按行追加为规则</MudButton>
+                </MudStack>
+            </MudPaper>
+
+            <MudText Typo="Typo.caption">可用文本变量：<code>{time}</code>@(textDictionaryNames.Count > 0 ? "、" + string.Join("、", textDictionaryNames.Select(x => $"{{{x}}}")) : string.Empty)</MudText>
+        }
+        else
+        {
+            <MudTextField @bind-Value="forwardSourceUrlsText" @bind-Value:after="OnInputsChanged"
+                          Label="转发来源消息链接（每行一个）"
+                          Variant="Variant.Outlined"
+                          Lines="4"
+                          Immediate="true"
+                          HelperText="支持公开消息链接和 t.me/c 私有链接，例如 https://t.me/channel/123 或 https://t.me/c/1234567890/123。" />
+            <MudSelect T="string" @bind-Value="forwardMode" @bind-Value:after="OnInputsChanged"
+                       Label="转发方式" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem Value="@UserChatActiveForwardModes.WithAttribution">带引用转发</MudSelectItem>
+                <MudSelectItem Value="@UserChatActiveForwardModes.HideAttribution">不带引用转发</MudSelectItem>
+            </MudSelect>
+        }
+
+
+        <MudGrid>
+            <MudItem xs="12" md="4">
+                <MudNumericField T="decimal" @bind-Value="delayMinSeconds" @bind-Value:after="OnInputsChanged"
+                                 Label="最小间隔(秒)" Variant="Variant.Outlined" Min="0" Max="600" Step="0.01m"
+                                 HelperText="支持小数秒，例如 0.01、0.1" />
+            </MudItem>
+            <MudItem xs="12" md="4">
+                <MudNumericField T="decimal" @bind-Value="delayMaxSeconds" @bind-Value:after="OnInputsChanged"
+                                 Label="最大间隔(秒)" Variant="Variant.Outlined" Min="0" Max="600" Step="0.01m"
+                                 HelperText="支持小数秒，例如 0.01、0.1" />
+            </MudItem>
+            <MudItem xs="12" md="4">
+                <MudNumericField T="int" @bind-Value="maxMessages" @bind-Value:after="OnInputsChanged"
+                                 Label="最多发送条数" Variant="Variant.Outlined" Min="0" Max="1000000"
+                                 HelperText="0 表示持续运行直到取消。" />
+            </MudItem>
+        </MudGrid>
+
+        <MudGrid>
+            <MudItem xs="12" md="@(IsGeneratedMessageMode ? 4 : 6)">
+                <MudSelect T="string" @bind-Value="accountMode" @bind-Value:after="OnInputsChanged"
+                           Label="账号选择模式" Variant="Variant.Outlined" Dense="true">
+                    <MudSelectItem Value="@UserChatActiveTaskModes.Random">随机</MudSelectItem>
+                    <MudSelectItem Value="@UserChatActiveTaskModes.Queue">队列循环</MudSelectItem>
+                </MudSelect>
+            </MudItem>
+            <MudItem xs="12" md="@(IsGeneratedMessageMode ? 4 : 6)">
+                <MudSelect T="string" @bind-Value="targetMode" @bind-Value:after="OnInputsChanged"
+                           Label="目标选择模式" Variant="Variant.Outlined" Dense="true">
+                    <MudSelectItem Value="@UserChatActiveTaskModes.Random">随机</MudSelectItem>
+                    <MudSelectItem Value="@UserChatActiveTaskModes.Queue">队列循环</MudSelectItem>
+                </MudSelect>
+            </MudItem>
+            @if (IsGeneratedMessageMode)
+            {
+                <MudItem xs="12" md="4">
+                    <MudSelect T="string" @bind-Value="messageMode" @bind-Value:after="OnInputsChanged"
+                               Label="内容模式" Variant="Variant.Outlined" Dense="true">
+                        <MudSelectItem Value="@UserChatActiveTaskModes.Random">随机</MudSelectItem>
+                        <MudSelectItem Value="@UserChatActiveTaskModes.Queue">队列循环</MudSelectItem>
+                    </MudSelect>
+                </MudItem>
+            }
+        </MudGrid>
+
+        <MudDivider Class="my-2" />
+
+        @if (IsGeneratedMessageMode)
+        {
+            <MudSwitch T="bool" @bind-Value="enableAiVerification" @bind-Value:after="OnInputsChanged"
+                       Label="启用 AI 验证消息识别" Color="Color.Primary" />
+
+            @if (enableAiVerification)
+        {
+            <MudGrid>
+                <MudItem xs="12" md="6">
+                    <MudSelect T="string" @bind-Value="selectedAiModelOption" @bind-Value:after="OnInputsChanged"
+                               Label="任务模型" Variant="Variant.Outlined" Dense="true"
+                               HelperText="可使用全局默认模型，也可以为当前任务单独指定模型。">
+                        <MudSelectItem Value="@UseGlobalDefaultModelOption">@UseGlobalDefaultModelLabel</MudSelectItem>
+                        @foreach (var model in selectableAiModels)
+                        {
+                            <MudSelectItem Value="@model">@model</MudSelectItem>
+                        }
+                        <MudSelectItem Value="@CustomModelOption">自定义模型</MudSelectItem>
+                    </MudSelect>
+                </MudItem>
+                <MudItem xs="12" md="6">
+                    <MudNumericField T="int" @bind-Value="verificationTimeoutSeconds" @bind-Value:after="OnInputsChanged"
+                                     Label="验证等待超时(秒)" Variant="Variant.Outlined" Min="3" Max="300"
+                                     HelperText="发送活跃消息后，在此时间窗口内等待验证机器人消息。" />
+                </MudItem>
+            </MudGrid>
+
+            <MudSwitch T="bool" @bind-Value="verificationTimeoutAsFailure" @bind-Value:after="OnInputsChanged"
+                       Label="验证超时计入失败" Color="Color.Primary" />
+
+            @if (IsCustomAiModelSelected)
+            {
+                <MudTextField @bind-Value="customAiModel" @bind-Value:after="OnInputsChanged"
+                              Label="自定义模型名" Variant="Variant.Outlined"
+                              HelperText="例如：gpt-4o-mini、qwen-vl-plus、glm-4.5v。" />
+            }
+
+            <MudGrid>
+                <MudItem xs="12" md="6">
+                    <MudSelect T="string" @bind-Value="verificationMatchMode" @bind-Value:after="OnInputsChanged"
+                               Label="验证消息匹配方式" Variant="Variant.Outlined" Dense="true"
+                               HelperText="默认仅匹配 bot 消息；开启“指定用户名”后按名单匹配。关键词/正则会同时匹配消息正文与按钮文字。">
+                        <MudSelectItem Value="@UserChatActiveAiVerificationMatchModes.MentionOrReply">仅 &#64;账号 / 回复消息</MudSelectItem>
+                        <MudSelectItem Value="@UserChatActiveAiVerificationMatchModes.Keyword">关键词匹配</MudSelectItem>
+                        <MudSelectItem Value="@UserChatActiveAiVerificationMatchModes.Regex">正则匹配</MudSelectItem>
+                    </MudSelect>
+                </MudItem>
+            </MudGrid>
+
+            <MudSwitch T="bool" @bind-Value="verificationBotUsernameFilterEnabled" @bind-Value:after="OnInputsChanged"
+                       Label="仅匹配指定的机器人用户名/ID" Color="Color.Primary" />
+
+            @if (verificationBotUsernameFilterEnabled)
+            {
+                <MudTextField @bind-Value="verificationBotUsernamesText" @bind-Value:after="OnInputsChanged"
+                              Label="机器人用户名/ID（每行一个）"
+                              Variant="Variant.Outlined"
+                              Lines="4"
+                              Immediate="true"
+                              HelperText="支持 &#64;用户名、纯数字 ID、-100 开头频道/群 ID、user:/chat: 前缀。机器人以频道/匿名身份发言时，请填写对应频道用户名或 ID。" />
+            }
+
+            @if (IsKeywordMatchMode)
+            {
+                <MudTextField @bind-Value="verificationKeywordsText" @bind-Value:after="OnInputsChanged"
+                              Label="验证关键词（每行一个）"
+                              Variant="Variant.Outlined"
+                              Lines="4"
+                              Immediate="true"
+                              HelperText="命中任意关键词即触发 AI 识别（不区分大小写）。" />
+            }
+
+            @if (IsRegexMatchMode)
+            {
+                <MudTextField @bind-Value="verificationRegexText" @bind-Value:after="OnInputsChanged"
+                              Label="验证正则（每行一个）"
+                              Variant="Variant.Outlined"
+                              Lines="4"
+                              Immediate="true"
+                              HelperText="示例：人机验证|验证码|captcha。正则不区分大小写。" />
+            }
+
+            <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Dense="true">
+                @if (IsKeywordMatchMode)
+                {
+                    <div>仅处理同一目标群里的 <strong>bot</strong> 消息，且命中你设置的关键词。</div>
+                }
+                else if (IsRegexMatchMode)
+                {
+                    <div>仅处理同一目标群里的 <strong>bot</strong> 消息，且匹配你设置的正则。</div>
+                }
+                else
+                {
+                    <div>仅处理同一目标群里的 <strong>bot</strong> 消息，并要求它 <strong>&#64;当前执行账号</strong> 或 <strong>直接回复刚发出的消息</strong>。</div>
+                }
+                <div>有按钮时会优先让 AI 决定点击哪个按钮；没有按钮时会让 AI 直接生成回复文本。</div>
+            </MudAlert>
+        }
+        }
+    }
+</MudStack>
+
+@code {
+    [Parameter] public ModuleTaskDraft Draft { get; set; }
+    [Parameter] public EventCallback<ModuleTaskDraft> DraftChanged { get; set; }
+    [Parameter] public string? InitialConfigJson { get; set; }
+
+    private const string UseGlobalDefaultModelOption = "__use_global_default__";
+    private const string CustomModelOption = "__custom_model__";
+
+    private List<AccountCategory> categories = new();
+    private List<string> textDictionaryNames = new();
+    private List<string> imageDictionaryNames = new();
+    private List<string> selectableAiModels = new();
+    private bool loading = true;
+    private bool initializedFromConfig;
+
+    private IEnumerable<int> selectedCategoryIds = Array.Empty<int>();
+    private string targetsText = string.Empty;
+    private List<MessageRuleDraft> messageRules = new() { new MessageRuleDraft() };
+    private string bulkRulesText = string.Empty;
+    private string messageActionMode = UserChatActiveMessageActionModes.SendGeneratedText;
+    private string replyToMessageUrl = string.Empty;
+    private string forwardSourceUrlsText = string.Empty;
+    private string forwardMode = UserChatActiveForwardModes.WithAttribution;
+    private bool skipIfLastMessageFromSelf;
+    private decimal delayMinSeconds = 15m;
+    private decimal delayMaxSeconds = 45m;
+    private int maxMessages;
+    private bool enableAiVerification;
+    private int verificationTimeoutSeconds = 15;
+    private bool verificationTimeoutAsFailure;
+    private string verificationMatchMode = UserChatActiveAiVerificationMatchModes.MentionOrReply;
+    private string verificationKeywordsText = string.Empty;
+    private string verificationRegexText = string.Empty;
+    private bool verificationBotUsernameFilterEnabled;
+    private string verificationBotUsernamesText = string.Empty;
+    private string? initialAiModel;
+    private string selectedAiModelOption = UseGlobalDefaultModelOption;
+    private string customAiModel = string.Empty;
+    private string globalDefaultAiModelLabel = "使用全局默认（未配置）";
+
+    private string accountMode = UserChatActiveTaskModes.Random;
+    private string targetMode = UserChatActiveTaskModes.Queue;
+    private string messageMode = UserChatActiveTaskModes.Random;
+
+    private bool IsCustomAiModelSelected => string.Equals(selectedAiModelOption, CustomModelOption, StringComparison.Ordinal);
+    private string UseGlobalDefaultModelLabel => globalDefaultAiModelLabel;
+    private bool IsKeywordMatchMode => string.Equals(verificationMatchMode, UserChatActiveAiVerificationMatchModes.Keyword, StringComparison.Ordinal);
+    private bool IsRegexMatchMode => string.Equals(verificationMatchMode, UserChatActiveAiVerificationMatchModes.Regex, StringComparison.Ordinal);
+    private bool IsGeneratedMessageMode => string.Equals(messageActionMode, UserChatActiveMessageActionModes.SendGeneratedText, StringComparison.Ordinal);
+
+    protected override async Task OnInitializedAsync()
+    {
+        ApplyInitialConfigIfNeeded();
+
+        try
+        {
+            categories = (await CategoryManagement.GetAllCategoriesAsync())
+                .Where(x => !x.ExcludeFromOperations)
+                .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            textDictionaryNames = (await DictionaryService.GetAllAsync())
+                .Where(x => x.IsEnabled && string.Equals(x.Type, DataDictionaryTypes.Text, StringComparison.OrdinalIgnoreCase))
+                .Where(x => x.Items.Any(i => i.IsEnabled && !string.IsNullOrWhiteSpace(i.TextValue)))
+                .Select(x => x.Name)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            imageDictionaryNames = (await DictionaryService.GetAllAsync())
+                .Where(x => x.IsEnabled && string.Equals(x.Type, DataDictionaryTypes.Image, StringComparison.OrdinalIgnoreCase))
+                .Where(x => x.Items.Any(i => i.IsEnabled && !string.IsNullOrWhiteSpace(i.AssetPath)))
+                .Select(x => x.Name)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            LoadAiSettings();
+        }
+        finally
+        {
+            loading = false;
+        }
+
+        await PushDraftAsync();
+    }
+
+    private void ApplyInitialConfigIfNeeded()
+    {
+        if (initializedFromConfig)
+            return;
+
+        initializedFromConfig = true;
+
+        var raw = (InitialConfigJson ?? string.Empty).Trim();
+        if (raw.Length == 0)
+            return;
+
+        try
+        {
+            var cfg = JsonSerializer.Deserialize<UserChatActiveTaskConfig>(raw);
+            if (cfg == null)
+                return;
+
+            selectedCategoryIds = NormalizeCategoryIds(cfg.CategoryIds, cfg.CategoryId);
+            targetsText = string.Join(Environment.NewLine, cfg.Targets ?? new List<string>());
+            messageActionMode = UserChatActiveMessageActionModes.Normalize(cfg.MessageActionMode);
+            replyToMessageUrl = cfg.ReplyToMessageUrl ?? string.Empty;
+            forwardSourceUrlsText = string.Join(Environment.NewLine, cfg.ForwardSourceUrls ?? new List<string>());
+            forwardMode = UserChatActiveForwardModes.Normalize(cfg.ForwardMode);
+            skipIfLastMessageFromSelf = cfg.SkipIfLastMessageFromSelf;
+            var legacyDictionary = cfg.Dictionary ?? new List<string>();
+            var legacyImageDictionaryName = ExtractDictionaryName(cfg.ImageDictionaryToken);
+            messageRules = BuildMessageRuleDrafts(cfg.MessageRules, legacyDictionary, legacyImageDictionaryName);
+            bulkRulesText = string.Empty;
+            delayMinSeconds = ConvertMillisecondsToSeconds(cfg.DelayMinMs);
+            delayMaxSeconds = ConvertMillisecondsToSeconds(cfg.DelayMaxMs);
+            maxMessages = cfg.MaxMessages;
+            accountMode = NormalizeMode(cfg.AccountMode);
+            targetMode = NormalizeMode(cfg.TargetMode);
+            messageMode = NormalizeMode(cfg.MessageMode);
+            enableAiVerification = cfg.EnableAiVerification;
+            verificationTimeoutSeconds = cfg.VerificationTimeoutSeconds < 3 ? 15 : cfg.VerificationTimeoutSeconds;
+            verificationTimeoutAsFailure = cfg.VerificationTimeoutAsFailure;
+            initialAiModel = AiOpenAiSettingsSnapshot.NormalizeModel(cfg.AiModel);
+            verificationMatchMode = UserChatActiveAiVerificationMatchModes.Normalize(cfg.VerificationMatchMode);
+            verificationKeywordsText = string.Join(Environment.NewLine, cfg.VerificationKeywords ?? new List<string>());
+            verificationRegexText = string.Join(Environment.NewLine, cfg.VerificationRegexes ?? new List<string>());
+            verificationBotUsernameFilterEnabled = cfg.VerificationBotUsernameFilterEnabled;
+            verificationBotUsernamesText = string.Join(Environment.NewLine, cfg.VerificationBotUsernames ?? new List<string>());
+        }
+        catch
+        {
+            // 忽略旧配置解析失败，回退到默认值。
+        }
+    }
+
+    private void LoadAiSettings()
+    {
+        var snapshot = AiOptionsMonitor.CurrentValue.ToSnapshot();
+        selectableAiModels = snapshot.GetSelectableModels().ToList();
+        var defaultModel = AiOpenAiSettingsSnapshot.NormalizeModel(snapshot.DefaultModel);
+        globalDefaultAiModelLabel = string.IsNullOrWhiteSpace(defaultModel)
+            ? "使用全局默认（未配置）"
+            : $"使用全局默认（{defaultModel}）";
+
+        ApplyAiModelSelection(initialAiModel);
+    }
+
+    private void ApplyAiModelSelection(string? model)
+    {
+        var normalized = AiOpenAiSettingsSnapshot.NormalizeModel(model);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            selectedAiModelOption = UseGlobalDefaultModelOption;
+            customAiModel = string.Empty;
+            return;
+        }
+
+        if (selectableAiModels.Any(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase)))
+        {
+            selectedAiModelOption = selectableAiModels.First(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase));
+            customAiModel = string.Empty;
+            return;
+        }
+
+        selectedAiModelOption = CustomModelOption;
+        customAiModel = normalized;
+    }
+
+    private string? ResolveSelectedAiModel()
+    {
+        if (string.Equals(selectedAiModelOption, UseGlobalDefaultModelOption, StringComparison.Ordinal))
+            return null;
+
+        if (string.Equals(selectedAiModelOption, CustomModelOption, StringComparison.Ordinal))
+            return AiOpenAiSettingsSnapshot.NormalizeModel(customAiModel);
+
+        return AiOpenAiSettingsSnapshot.NormalizeModel(selectedAiModelOption);
+    }
+
+    private async Task OnSelectedCategoriesChanged(IEnumerable<int> values)
+    {
+        selectedCategoryIds = NormalizeCategoryIds(values, 0);
+        await OnInputsChanged();
+    }
+
+    private async Task OnInputsChanged()
+    {
+        await PushDraftAsync();
+    }
+
+    private async Task PushDraftAsync()
+    {
+        var targets = ParseTargetLines(targetsText);
+        var normalizedActionMode = UserChatActiveMessageActionModes.Normalize(messageActionMode);
+        var isGeneratedMode = string.Equals(normalizedActionMode, UserChatActiveMessageActionModes.SendGeneratedText, StringComparison.Ordinal);
+        var normalizedForwardMode = UserChatActiveForwardModes.Normalize(forwardMode);
+        var normalizedMessageRules = isGeneratedMode ? NormalizeMessageRuleDrafts(messageRules) : new List<UserChatActiveMessageRule>();
+        var dictionary = normalizedMessageRules.Select(x => x.Text ?? string.Empty).Where(x => x.Length > 0).ToList();
+        var sharedImageDictionaryToken = ResolveSharedImageDictionaryToken(normalizedMessageRules);
+        var forwardSourceUrls = isGeneratedMode ? new List<string>() : ParseTargetLines(forwardSourceUrlsText);
+        var verificationKeywords = ParseVerificationLines(verificationKeywordsText);
+        var verificationRegexes = ParseVerificationLines(verificationRegexText);
+        var verificationBotUsernames = ParseBotUsernames(verificationBotUsernamesText);
+        var normalizedMatchMode = UserChatActiveAiVerificationMatchModes.Normalize(verificationMatchMode);
+        var selectedIds = NormalizeCategoryIds(selectedCategoryIds, 0);
+        var selectedCategories = categories.Where(x => selectedIds.Contains(x.Id)).ToList();
+
+        if (loading)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "账号分类加载中"));
+            return;
+        }
+
+        if (categories.Count == 0)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "没有可用账号分类（或都被标记为排除操作）"));
+            return;
+        }
+
+        if (selectedCategories.Count == 0)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请至少选择一个执行账号分类"));
+            return;
+        }
+
+        if (targets.Count == 0)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请至少填写一个目标群组/频道/Bot"));
+            return;
+        }
+
+        foreach (var target in targets)
+        {
+            if (TemplateRendering.ExtractSingleTokenName(target) is not { Length: > 0 })
+                continue;
+
+            try
+            {
+                await TemplateRendering.ValidateTextDictionaryTokenAsync(target);
+            }
+            catch (Exception ex)
+            {
+                await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, $"目标字典无效：{ex.Message}"));
+                return;
+            }
+        }
+
+        if (isGeneratedMode)
+        {
+            if (normalizedMessageRules.Count == 0)
+            {
+                await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请至少添加一条消息规则"));
+                return;
+            }
+
+            foreach (var rule in normalizedMessageRules)
+            {
+                if (!string.IsNullOrWhiteSpace(rule.Text))
+                {
+                    try
+                    {
+                        await TemplateRendering.ValidateTextTemplateAsync(rule.Text);
+                    }
+                    catch (Exception ex)
+                    {
+                        await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, $"消息规则模板无效：{ex.Message}"));
+                        return;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(rule.ImageDictionaryToken))
+                {
+                    try
+                    {
+                        await TemplateRendering.ValidateImageTemplateAsync(rule.ImageDictionaryToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, $"图片字典无效：{ex.Message}"));
+                        return;
+                    }
+                }
+            }
+        }
+        else if (forwardSourceUrls.Count == 0)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请至少填写一个转发来源消息链接"));
+            return;
+        }
+
+        if (delayMinSeconds < 0 || delayMaxSeconds < 0)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "间隔不能为负数"));
+            return;
+        }
+
+        if (delayMaxSeconds < delayMinSeconds)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "最大间隔不能小于最小间隔"));
+            return;
+        }
+
+        if (maxMessages < 0)
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "最多发送条数不能小于 0"));
+            return;
+        }
+
+        var effectiveMessageMode = isGeneratedMode ? messageMode : UserChatActiveTaskModes.Random;
+
+        if (!IsValidMode(accountMode) || !IsValidMode(targetMode) || !IsValidMode(effectiveMessageMode) || !IsValidMessageActionMode(normalizedActionMode) || !IsValidForwardMode(normalizedForwardMode))
+        {
+            await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "模式参数无效"));
+            return;
+        }
+
+        var resolvedAiModel = isGeneratedMode ? ResolveSelectedAiModel() : null;
+        if (isGeneratedMode && enableAiVerification)
+        {
+            if (verificationTimeoutSeconds < 3 || verificationTimeoutSeconds > 300)
+            {
+                await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "验证等待超时范围应为 3-300 秒"));
+                return;
+            }
+
+            if (IsCustomAiModelSelected && string.IsNullOrWhiteSpace(resolvedAiModel))
+            {
+                await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请选择有效的自定义模型名"));
+                return;
+            }
+
+            if (string.Equals(normalizedMatchMode, UserChatActiveAiVerificationMatchModes.Keyword, StringComparison.Ordinal)
+                && verificationKeywords.Count == 0)
+            {
+                await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请选择至少一个验证关键词"));
+                return;
+            }
+
+            if (string.Equals(normalizedMatchMode, UserChatActiveAiVerificationMatchModes.Regex, StringComparison.Ordinal))
+            {
+                if (verificationRegexes.Count == 0)
+                {
+                    await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请选择至少一个验证正则"));
+                    return;
+                }
+
+                foreach (var pattern in verificationRegexes)
+                {
+                    try
+                    {
+                        _ = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                    }
+                    catch (Exception ex)
+                    {
+                        await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, $"验证正则无效：{ex.Message}"));
+                        return;
+                    }
+                }
+            }
+
+            if (verificationBotUsernameFilterEnabled && verificationBotUsernames.Count == 0)
+            {
+                await DraftChanged.InvokeAsync(new ModuleTaskDraft(0, null, false, "请至少填写一个机器人用户名或 ID"));
+                return;
+            }
+        }
+
+
+        var categoryNames = selectedCategories.Select(x => x.Name).ToList();
+        var cfg = new UserChatActiveTaskConfig
+        {
+            CategoryId = selectedCategories[0].Id,
+            CategoryName = selectedCategories[0].Name,
+            CategoryIds = selectedCategories.Select(x => x.Id).ToList(),
+            CategoryNames = categoryNames,
+            Targets = targets,
+            MessageActionMode = normalizedActionMode,
+            ReplyToMessageUrl = isGeneratedMode && !string.IsNullOrWhiteSpace(replyToMessageUrl) ? replyToMessageUrl.Trim() : null,
+            ReplyToMessageId = null,
+            ForwardSourceUrls = forwardSourceUrls,
+            ForwardMode = normalizedForwardMode,
+            SkipIfLastMessageFromSelf = skipIfLastMessageFromSelf,
+            Dictionary = dictionary,
+            ImageDictionaryToken = sharedImageDictionaryToken,
+            MessageRules = normalizedMessageRules,
+            DelayMinMs = ConvertSecondsToMilliseconds(delayMinSeconds),
+            DelayMaxMs = ConvertSecondsToMilliseconds(delayMaxSeconds),
+            MaxMessages = maxMessages,
+            AccountMode = accountMode,
+            TargetMode = targetMode,
+            MessageMode = effectiveMessageMode,
+            EnableAiVerification = isGeneratedMode && enableAiVerification,
+            AiModel = isGeneratedMode && enableAiVerification ? resolvedAiModel : null,
+            VerificationTimeoutSeconds = isGeneratedMode && enableAiVerification ? verificationTimeoutSeconds : 15,
+            VerificationTimeoutAsFailure = isGeneratedMode && enableAiVerification && verificationTimeoutAsFailure,
+            VerificationMatchMode = normalizedMatchMode,
+            VerificationKeywords = isGeneratedMode ? verificationKeywords : new List<string>(),
+            VerificationRegexes = isGeneratedMode ? verificationRegexes : new List<string>(),
+            VerificationBotUsernameFilterEnabled = isGeneratedMode && enableAiVerification && verificationBotUsernameFilterEnabled,
+            VerificationBotUsernames = isGeneratedMode ? verificationBotUsernames : new List<string>()
+        };
+
+        var total = maxMessages > 0 ? maxMessages : 0;
+        var json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
+        await DraftChanged.InvokeAsync(new ModuleTaskDraft(total, json, true, null));
+    }
+
+    private async Task AddMessageRule()
+    {
+        messageRules.Add(new MessageRuleDraft());
+        await PushDraftAsync();
+    }
+
+    private async Task RemoveMessageRule(int index)
+    {
+        if (messageRules.Count <= 1 || index < 0 || index >= messageRules.Count)
+            return;
+
+        messageRules.RemoveAt(index);
+        await PushDraftAsync();
+    }
+
+    private async Task AppendBulkRules()
+    {
+        var lines = ParseTargetLines(bulkRulesText);
+        if (lines.Count == 0)
+            return;
+
+        if (messageRules.Count == 1
+            && string.IsNullOrWhiteSpace(messageRules[0].Text)
+            && string.IsNullOrWhiteSpace(messageRules[0].ImageDictionaryName))
+        {
+            messageRules.Clear();
+        }
+
+        messageRules.AddRange(lines.Select(x => new MessageRuleDraft { Text = x }));
+        bulkRulesText = string.Empty;
+        await PushDraftAsync();
+    }
+
+    private static List<MessageRuleDraft> BuildMessageRuleDrafts(
+        IEnumerable<UserChatActiveMessageRule>? configuredRules,
+        IEnumerable<string>? legacyDictionary,
+        string legacyImageDictionaryName)
+    {
+        var rules = (configuredRules ?? Array.Empty<UserChatActiveMessageRule>())
+            .Select(x => new MessageRuleDraft
+            {
+                Text = NormalizeMultilineText(x?.Text),
+                ImageDictionaryName = ExtractDictionaryName(x?.ImageDictionaryToken)
+            })
+            .Where(x => x.Text.Length > 0 || x.ImageDictionaryName.Length > 0)
+            .ToList();
+
+        if (rules.Count > 0)
+            return rules;
+
+        rules = (legacyDictionary ?? Array.Empty<string>())
+            .Select(x => NormalizeMultilineText(x))
+            .Where(x => x.Length > 0)
+            .Select(x => new MessageRuleDraft { Text = x, ImageDictionaryName = legacyImageDictionaryName })
+            .ToList();
+
+        if (rules.Count == 0 && legacyImageDictionaryName.Length > 0)
+            rules.Add(new MessageRuleDraft { ImageDictionaryName = legacyImageDictionaryName });
+
+        if (rules.Count == 0)
+            rules.Add(new MessageRuleDraft());
+
+        return rules;
+    }
+
+    private static List<UserChatActiveMessageRule> NormalizeMessageRuleDrafts(IEnumerable<MessageRuleDraft>? drafts)
+    {
+        return (drafts ?? Array.Empty<MessageRuleDraft>())
+            .Select(x => new UserChatActiveMessageRule
+            {
+                Text = NormalizeMultilineText(x?.Text),
+                ImageDictionaryToken = BuildDictionaryToken(x?.ImageDictionaryName)
+            })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Text) || !string.IsNullOrWhiteSpace(x.ImageDictionaryToken))
+            .ToList();
+    }
+
+    private static string? ResolveSharedImageDictionaryToken(IEnumerable<UserChatActiveMessageRule> rules)
+    {
+        var tokens = rules
+            .Select(x => (x.ImageDictionaryToken ?? string.Empty).Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return tokens.Count == 1 && tokens[0].Length > 0 ? tokens[0] : null;
+    }
+
+    private static string? BuildDictionaryToken(string? name)
+    {
+        var normalized = (name ?? string.Empty).Trim().Trim('{', '}');
+        return normalized.Length == 0 ? null : $"{{{normalized}}}";
+    }
+
+    private static string NormalizeMultilineText(string? value)
+    {
+        return (value ?? string.Empty)
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Trim();
+    }
+
+    private static List<int> NormalizeCategoryIds(IEnumerable<int>? values, int fallback)
+    {
+        var ids = (values ?? Array.Empty<int>())
+            .Where(x => x > 0)
+            .Distinct()
+            .ToList();
+
+        if (ids.Count == 0 && fallback > 0)
+            ids.Add(fallback);
+
+        return ids;
+    }
+
+    private static decimal ConvertMillisecondsToSeconds(int value)
+    {
+        if (value <= 0)
+            return 0m;
+
+        return Math.Round(value / 1000m, 3, MidpointRounding.AwayFromZero);
+    }
+
+    private static int ConvertSecondsToMilliseconds(decimal value)
+    {
+        if (value <= 0)
+            return 0;
+
+        return (int)Math.Round(value * 1000m, MidpointRounding.AwayFromZero);
+    }
+
+    private static bool IsValidMode(string? value)
+    {
+        return string.Equals(value, UserChatActiveTaskModes.Random, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(value, UserChatActiveTaskModes.Queue, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeMode(string? value)
+    {
+        return string.Equals(value, UserChatActiveTaskModes.Queue, StringComparison.OrdinalIgnoreCase)
+            ? UserChatActiveTaskModes.Queue
+            : UserChatActiveTaskModes.Random;
+    }
+
+    private static bool IsValidMessageActionMode(string? value)
+    {
+        return string.Equals(value, UserChatActiveMessageActionModes.SendGeneratedText, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(value, UserChatActiveMessageActionModes.ForwardUrl, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsValidForwardMode(string? value)
+    {
+        return string.Equals(value, UserChatActiveForwardModes.WithAttribution, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(value, UserChatActiveForwardModes.HideAttribution, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ExtractDictionaryName(string? token)
+    {
+        var text = (token ?? string.Empty).Trim();
+        return text.StartsWith('{') && text.EndsWith('}') && text.Length > 2
+            ? text[1..^1].Trim()
+            : string.Empty;
+    }
+
+    private static List<string> ParseTargetLines(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return new List<string>();
+
+        return text
+            .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => (x ?? string.Empty).Trim())
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private sealed class MessageRuleDraft
+    {
+        public string Id { get; } = Guid.NewGuid().ToString("N");
+        public string Text { get; set; } = string.Empty;
+        public string ImageDictionaryName { get; set; } = string.Empty;
+    }
+
+    private static List<string> ParseVerificationLines(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return new List<string>();
+
+        return text
+            .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => (x ?? string.Empty).Trim())
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static List<string> ParseBotUsernames(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return new List<string>();
+
+        return text
+            .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => (x ?? string.Empty).Trim().TrimStart('@'))
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+}

@@ -57,7 +57,7 @@
     {
         model = Clone(Api);
         var cfg = model.Config ?? new JsonObject();
-        configJson = cfg.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        configJson = TelegramPanel.Web.Services.LocalConfigFile.ToIndentedJson(cfg);
     }
 
     private void Cancel() => MudDialog.Cancel();
@@ -121,7 +121,6 @@
             Type = src.Type,
             Enabled = src.Enabled,
             ApiKey = src.ApiKey,
-            Kick = src.Kick,
             Config = src.Config ?? new JsonObject()
         };
     }

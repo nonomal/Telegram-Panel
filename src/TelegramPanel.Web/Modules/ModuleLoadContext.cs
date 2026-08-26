@@ -32,13 +32,20 @@ public sealed class ModuleLoadContext : AssemblyLoadContext
             || name.StartsWith("Microsoft.AspNetCore.", StringComparison.OrdinalIgnoreCase)
             || name.StartsWith("Microsoft.JSInterop", StringComparison.OrdinalIgnoreCase)
             || name.StartsWith("TelegramPanel.", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(name, "MudBlazor", StringComparison.OrdinalIgnoreCase))
-            return null;
+            || string.Equals(name, "MudBlazor", StringComparison.OrdinalIgnoreCase)
+            // TelegramPanel 宿主内置依赖：模块可直接复用宿主版本，避免重复携带导致包体积膨胀。
+            || string.Equals(name, "WTelegramClient", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "PhoneNumbers", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "SixLabors.ImageSharp", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "Microsoft.Data.Sqlite", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Microsoft.EntityFrameworkCore", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("SQLitePCLRaw", StringComparison.OrdinalIgnoreCase))
+            return LoadFromDefaultContext(assemblyName);
 
         // 2) 其次：如果宿主已经加载过同名程序集，则同样交给 Default ALC（避免重复加载）。
-        if (AssemblyLoadContext.Default.Assemblies.Any(a =>
-                string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase)))
-            return null;
+        var defaultAssembly = FindDefaultAssembly(assemblyName);
+        if (defaultAssembly != null)
+            return defaultAssembly;
 
         var path = _resolver.ResolveAssemblyToPath(assemblyName);
         if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
@@ -53,6 +60,51 @@ public sealed class ModuleLoadContext : AssemblyLoadContext
             return LoadFromAssemblyPath(candidate);
 
         return null;
+    }
+
+    private static Assembly? LoadFromDefaultContext(AssemblyName assemblyName)
+    {
+        var existing = FindDefaultAssembly(assemblyName);
+        if (existing != null)
+            return existing;
+
+        try
+        {
+            return AssemblyLoadContext.Default.LoadFromAssemblyName(assemblyName);
+        }
+        catch (FileNotFoundException)
+        {
+        }
+        catch (FileLoadException)
+        {
+        }
+
+        var name = (assemblyName.Name ?? "").Trim();
+        if (name.Length == 0)
+            return null;
+
+        var candidate = Path.Combine(AppContext.BaseDirectory, name + ".dll");
+        if (!File.Exists(candidate))
+            return null;
+
+        try
+        {
+            return AssemblyLoadContext.Default.LoadFromAssemblyPath(candidate);
+        }
+        catch (FileLoadException)
+        {
+            return FindDefaultAssembly(assemblyName);
+        }
+    }
+
+    private static Assembly? FindDefaultAssembly(AssemblyName assemblyName)
+    {
+        var name = (assemblyName.Name ?? "").Trim();
+        if (name.Length == 0)
+            return null;
+
+        return AssemblyLoadContext.Default.Assemblies
+            .FirstOrDefault(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
     }
 
     protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
